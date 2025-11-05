@@ -1,5 +1,5 @@
 /**
- * @file    hydro_controller_ema_ph.ino
+ * @file    hydra_main.ino
  * @brief   Hydroponics controller with EC-first strategy and EMA-driven pH dosing.
  *
  * @details
@@ -63,8 +63,11 @@
 #define LCD_COLS        20        // CHANGE IF USING A DIFFERENT LCD WIDTH
 #define LCD_ROWS        4         // CHANGE IF USING A DIFFERENT LCD HEIGHT
 #define LCD_UPDATE_MS   1000UL    // CHANGE TO ADJUST LCD REFRESH PERIOD (MS)
-#define LCD_PAGE_MS     3000UL    // CHANGE TO ADJUST TIME EACH SCREEN IS SHOWN (MS)
-#define LCD_REINIT_MS   300000UL  // CHANGE TO ADJUST LCD RE-INIT INTERVAL (MS)
+
+// Page timing: make one full page cycle match the 10 s sensor cadence.
+#define LCD_PAGES                     3       // NUMBER OF LCD PAGES (A,B,C)
+#define LCD_SYNC_TO_SENSOR_INTERVAL   1       // 1=ON: auto size page time to SENSOR_INTERVAL/LCD_PAGES
+#define LCD_PAGE_MS_USER              3000UL  // ONLY USED IF LCD_SYNC_TO_SENSOR_INTERVAL==0
 
 // ---------- ADC reference ----------
 #define ANALOG_REF_MV   5000.0    // CHANGE TO 3300.0 IF YOUR MCU ADC REFERENCE IS 3.3 V
@@ -75,7 +78,7 @@ static const double EC_SETPOINT = 1600.0; // CHANGE TO YOUR TARGET EC IN µS/cm 
 
 // ---------- Control bands ----------
 static const double PH_DEADBAND = 0.15;   // CHANGE TO WIDEN/NARROW PH ALLOWED ERROR (PH UNITS, ±)
-static const double EC_DEADBAND = 25.0;   // CHANGE TO WIDEN/NARROW EC ALLOWED ERROR (µS/cm, ±)
+static const double EC_DEADBAND = 50.0;   // CHANGE TO WIDEN/NARROW EC ALLOWED ERROR (µS/cm, ±)
 
 // ---------- EC temperature compensation ----------
 static const double ALPHA = 0.02;         // CHANGE TEMP COEFFICIENT FRACTION PER °C (TYPICAL 0.02)
@@ -100,10 +103,10 @@ static const unsigned long EC_DOWN_MIX_LOCKOUT_MS = 600000UL; // CHANGE MIX TIME
 static const unsigned long PH_DOWN_MIX_LOCKOUT_MS = 900000UL; // CHANGE LOCKOUT AFTER PH-DOWN (MS)
 
 // ---------- Hourly caps (mL/h) per direction ----------
-static const double  EC_A_MAX_ML_PER_HR    = 60.0;  // CHANGE MAXIMUM NUTRIENT-A ML PER HOUR
-static const double  EC_B_MAX_ML_PER_HR    = 60.0;  // CHANGE MAXIMUM NUTRIENT-B ML PER HOUR
-static const double  EC_DOWN_MAX_ML_PER_HR = 0.0;   // SET TO >0 IF ENABLING EC-DOWN
-static const double  PH_DOWN_MAX_ML_PER_HR = 12.0;  // CHANGE MAXIMUM PH-DOWN ML PER HOUR
+static const double  EC_A_MAX_ML_PER_HR    = 40.0;  // CHANGE MAXIMUM NUTRIENT-A ML PER HOUR
+static const double  EC_B_MAX_ML_PER_HR    = 40.0;  // CHANGE MAXIMUM NUTRIENT-B ML PER HOUR
+static const double  EC_DOWN_MAX_ML_PER_HR = 100.0; // SET TO >0 IF ENABLING EC-DOWN
+static const double  PH_DOWN_MAX_ML_PER_HR = 2.0;   // CHANGE MAXIMUM PH-DOWN ML PER HOUR
 
 // ---------- Sensor / control cadence ----------
 static const unsigned long SENSOR_INTERVAL = 10000UL; // CHANGE HOW OFTEN TO READ/CONTROL (MS)
@@ -116,6 +119,13 @@ static const unsigned long SENSOR_INTERVAL = 10000UL; // CHANGE HOW OFTEN TO REA
 /* ============================================================
  *                   Globals and Instances
  * ============================================================ */
+
+#if LCD_SYNC_TO_SENSOR_INTERVAL
+  #define LCD_PAGE_MS  (SENSOR_INTERVAL / LCD_PAGES)   // e.g., 10000/3 = 3333 ms
+#else
+  #define LCD_PAGE_MS  LCD_PAGE_MS_USER
+#endif
+#define LCD_REINIT_MS  300000UL
 
 DFRobot_PH ph_sensor;
 OneWire oneWire(DS18B20_PIN);
@@ -133,7 +143,7 @@ static unsigned long previous_millis = 0;
 static unsigned long last_lcd_ms = 0;
 static unsigned long last_page_ms = 0;
 static unsigned long last_lcd_reinit_ms = 0;
-static uint8_t lcd_page = 0;            // 0 = page A, 1 = page B
+static uint8_t lcd_page = 0;            // 0 = A, 1 = B, 2 = C
 
 // EC dosing state
 static unsigned long last_dose_ms_ec_cycle = 0;  // Time of last A dose (cycle start)
@@ -167,9 +177,6 @@ static double last_action_ml = 0.0;
  *                         Support utilities
  * ============================================================ */
 
-/**
- * @brief Reset watchdog and yield to scheduler.
- */
 static inline void watchdog_kick() {
   #if defined(ARDUINO_ARCH_AVR)
     wdt_reset();
@@ -177,10 +184,6 @@ static inline void watchdog_kick() {
   yield();
 }
 
-/**
- * @brief Delay while preserving watchdog and background tasks.
- * @param ms Milliseconds to delay.
- */
 static void safe_delay(unsigned long ms) {
   const unsigned long start = millis();
   while ((millis() - start) < ms) {
@@ -189,13 +192,6 @@ static void safe_delay(unsigned long ms) {
   }
 }
 
-/**
- * @brief Send an I²C command with basic retry logic.
- * @param address 7-bit I²C address.
- * @param command ASCII command string (no terminator required).
- * @param max_attempts Number of attempts.
- * @return true if transmission succeeded.
- */
 static bool i2c_send_with_retries(uint8_t address, const char* command, uint8_t max_attempts = 3) {
   for (uint8_t attempt = 0; attempt < max_attempts; ++attempt) {
     Wire.beginTransmission(address);
@@ -244,11 +240,12 @@ static void maybe_reset_hourly_caps();
 static void update_lcd();
 static void lcd_screen_A();
 static void lcd_screen_B();
+static void lcd_screen_C();
 
 // ESP8266 bridge
 static void send_line_to_esp8266();
 
-// NEW: EC status text helper
+// EC status text helper
 static const char* ec_status_text();
 
 /* ============================================================
@@ -283,7 +280,7 @@ void loop() {
   watchdog_kick();
   const unsigned long now = millis();
 
-  // Sensor cadence + control
+  // Sensor cadence + control (10 s default)
   if (now - previous_millis >= SENSOR_INTERVAL) {
     previous_millis = now;
 
@@ -318,8 +315,20 @@ void loop() {
   // LCD page rotation and refresh
   if (now - last_page_ms >= LCD_PAGE_MS) {
     last_page_ms = now;
-    lcd_page = (lcd_page + 1) % 2; // 0..1
+    lcd_page = (lcd_page + 1) % LCD_PAGES; // 0..(LCD_PAGES-1)
+
+    // Optional sync: when rolling over to page 0, align next sensor cycle
+    #if LCD_SYNC_TO_SENSOR_INTERVAL
+      if (lcd_page == 0) {
+        // Force next sensor cycle immediately after completing 3 pages.
+        // This keeps the "read → show A,B,C → read" rhythm.
+        if ((now - previous_millis) < SENSOR_INTERVAL) {
+          previous_millis = now - SENSOR_INTERVAL;
+        }
+      }
+    #endif
   }
+
   if (now - last_lcd_reinit_ms >= LCD_REINIT_MS) {
     initialise_display();
     last_lcd_reinit_ms = now;
@@ -346,16 +355,10 @@ void loop() {
  *                        Initialisation
  * ============================================================ */
 
-/**
- * @brief Configure MCU pins.
- */
 static void initialise_pins() {
   pinMode(PH_ANALOG_PIN, INPUT);
 }
 
-/**
- * @brief Start sensors and pin EZO-EC temp to 25.0 °C.
- */
 static void initialise_devices() {
   ph_sensor.begin();
   waterTemp.begin();
@@ -377,9 +380,6 @@ static void initialise_devices() {
   }
 }
 
-/**
- * @brief Initialise and clear the LCD.
- */
 static void initialise_display() {
   lcd.init();
   lcd.backlight();
@@ -394,10 +394,6 @@ static void initialise_display() {
  *                           Sensors
  * ============================================================ */
 
-/**
- * @brief Read DS18B20 water temperature.
- * @return Temperature in °C (clamped to last value if out-of-range).
- */
 static double read_water_temperature() {
   waterTemp.requestTemperatures();
   const double t = waterTemp.getTempCByIndex(0);
@@ -409,10 +405,6 @@ static double read_water_temperature() {
   return water_temperature;
 }
 
-/**
- * @brief Read pH analog voltage and update control EMA.
- * @return Instantaneous pH reading (raw).
- */
 static double read_ph_sensor() {
   const double voltage_mV = (analogRead(PH_ANALOG_PIN) / 1023.0) * ANALOG_REF_MV;
   ph_raw = ph_sensor.readPH(voltage_mV, water_temperature);
@@ -425,10 +417,6 @@ static double read_ph_sensor() {
   return ph_raw;
 }
 
-/**
- * @brief Trigger EZO-EC, read result, and apply temp compensation.
- * @return EC (µS/cm) at 25 °C.
- */
 static double read_ec_sensor() {
   send_command(EC_PROBE_ADDRESS, "R");
   safe_delay(600);
@@ -437,12 +425,6 @@ static double read_ec_sensor() {
   return ec_value;
 }
 
-/**
- * @brief Apply linear temperature compensation to EC.
- * @param ec_measured EC measured at temperature.
- * @param temperature Current °C.
- * @return EC compensated to 25 °C.
- */
 static double compensate_ec(double ec_measured, double temperature) {
   const double T_REF = 25.0;
   return ec_measured / (1.0 + ALPHA * (temperature - T_REF));
@@ -452,9 +434,6 @@ static double compensate_ec(double ec_measured, double temperature) {
  *                          I²C helpers
  * ============================================================ */
 
-/**
- * @brief Send an ASCII command over I²C with a small guard delay.
- */
 static void send_command(uint8_t address, const char *command) {
   if (!i2c_send_with_retries(address, command, 3)) {
     Serial.print(F("I2C send failed to 0x")); Serial.println(address, HEX);
@@ -462,10 +441,6 @@ static void send_command(uint8_t address, const char *command) {
   safe_delay(300);
 }
 
-/**
- * @brief Read a numeric ASCII result from an I²C device.
- * @return Parsed float value. 0.0 on error.
- */
 static float read_response_ec_numeric(uint8_t address) {
   const uint8_t bytes = Wire.requestFrom(address, (uint8_t)32);
   if (bytes == 0) {
@@ -482,10 +457,6 @@ static float read_response_ec_numeric(uint8_t address) {
   return atof(buf);
 }
 
-/**
- * @brief Read an ASCII response into a user buffer.
- * @return Bytes written into buf (excluding terminator).
- */
 static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen) {
   if (!buf || buflen == 0) return 0;
   const uint8_t bytes = Wire.requestFrom(address, (uint8_t)32);
@@ -504,10 +475,6 @@ static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen) {
  *                        Dosing primitives
  * ============================================================ */
 
-/**
- * @brief Dose nutrient A.
- * @param ml Millilitres to dose.
- */
 static void dose_nutrient_A(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -516,10 +483,6 @@ static void dose_nutrient_A(double ml) {
   strcpy(last_action, "A"); last_action_ml = ml;
 }
 
-/**
- * @brief Dose nutrient B.
- * @param ml Millilitres to dose.
- */
 static void dose_nutrient_B(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -528,10 +491,6 @@ static void dose_nutrient_B(double ml) {
   strcpy(last_action, "B"); last_action_ml = ml;
 }
 
-/**
- * @brief Dose EC-Down (water).
- * @param ml Millilitres to dose.
- */
 static void dose_ec_down(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -540,10 +499,6 @@ static void dose_ec_down(double ml) {
   strcpy(last_action, "ECD"); last_action_ml = ml;
 }
 
-/**
- * @brief Dose pH-Down.
- * @param ml Millilitres to dose.
- */
 static void dose_ph_down(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -556,19 +511,6 @@ static void dose_ph_down(double ml) {
  *                 EC-first conservative control loop
  * ============================================================ */
 
-/**
- * @brief Main control logic. EC is corrected first, then pH.
- *
- * Logic:
- * 1) Maintain rolling hourly caps per direction.
- * 2) If EC out of band, attempt EC-Down (water) or EC-Up (A then B) subject to:
- *    - Post-dose lockouts
- *    - Hourly caps
- *    - Non-blocking stagger between A and B
- * 3) Once EC is in band and has settled (post EC lockout), evaluate pH:
- *    - Use EMA control value ph_control to reduce noise.
- *    - Down-only pH correction with lockout and hourly cap.
- */
 static void control_loop() {
   const unsigned long now = millis();
 
@@ -665,9 +607,6 @@ static void control_loop() {
  *                     Hourly caps window reset
  * ============================================================ */
 
-/**
- * @brief Reset per-direction hourly counters on a sliding window.
- */
 static void maybe_reset_hourly_caps() {
   const unsigned long now = millis();
   const unsigned long HOUR_MS = 3600000UL;
@@ -689,26 +628,22 @@ static const char* ec_status_text() {
 }
 
 /* ============================================================
- *                           LCD UI (2 pages)
- *   A: RAW pH + EMA pH + setpoints + temp + EC status
- *   B: hourly usage vs caps + last action
+ *                           LCD UI (3 pages)
+ *   Page A: RAW pH + EMA pH + setpoints + temp + EC status
+ *   Page B: EC usage (A/B and ECD) + last action
+ *   Page C: pHD usage with 0.1 mL precision (+ SP/DB/EMA)
  * ============================================================ */
 
-/**
- * @brief Top-level LCD update. Switches between A and B.
- */
 static void update_lcd() {
   switch (lcd_page) {
     case 0: lcd_screen_A(); break;
-    default: lcd_screen_B(); break;
+    case 1: lcd_screen_B(); break;
+    default: lcd_screen_C(); break;
   }
 }
 
-/**
- * @brief LCD page A: show raw pH, control (EMA) pH, EC, setpoints, temperature, EC status.
- */
 static void lcd_screen_A() {
-  char b1[12], b2[12]; 
+  char b1[12], b2[12];
   uint8_t n;
   lcd.clear();
 
@@ -728,14 +663,12 @@ static void lcd_screen_A() {
   dtostrf(PH_CONTROL_EMA, 3, 2, b2); lcd.print(b2); n += strlen(b2);
   while (n < LCD_COLS) lcd.print(' '), n++;
 
-  // Row 2: EC, setpoint, status (no redeclarations)
+  // Row 2: EC, setpoint, status
   lcd.setCursor(0, 2); n = 0;
   lcd.print(F("EC:")); n += 3;
   dtostrf(ec_value, 6, 0, b1); lcd.print(b1); n += strlen(b1);
   lcd.print(F(" uS SP:")); n += 7;
   dtostrf(EC_SETPOINT, 4, 0, b2); lcd.print(b2); n += strlen(b2);
-
-  // Status at right edge: "ECup" | "ECdn" | "A->B" | "OK"
   const char* s = ec_status_text();
   uint8_t sLen = strlen(s);
   if (n + 1 + sLen <= LCD_COLS) {
@@ -754,9 +687,6 @@ static void lcd_screen_A() {
   while (n < LCD_COLS) lcd.print(' '), n++;
 }
 
-/**
- * @brief LCD page B: hourly caps usage and last action summary.
- */
 static void lcd_screen_B() {
   char b1[12], b2[12]; uint8_t n;
   lcd.clear();
@@ -777,16 +707,14 @@ static void lcd_screen_B() {
   ltoa(lround(EC_B_MAX_ML_PER_HR), b2, 10);    lcd.print(b2); n += strlen(b2);
   lcd.print(F(" mL")); n += 3; while (n < LCD_COLS) lcd.print(' '), n++;
 
-  // Row 2: EC-Down and pH-Down usage
+  // Row 2: EC-Down usage (shorthand)
   lcd.setCursor(0, 2); n = 0;
   lcd.print(F("ECD: ")); n += 5;
   ltoa(lround(ec_down_dosed_this_window), b1, 10); lcd.print(b1); n += strlen(b1);
   lcd.print(F("/")); n += 1;
   ltoa(lround(EC_DOWN_MAX_ML_PER_HR), b2, 10);     lcd.print(b2); n += strlen(b2);
-  lcd.print(F("  pHD: ")); n += 7;
-  ltoa(lround(ph_down_dosed_this_window), b1, 10);  lcd.print(b1); n += strlen(b1);
-  lcd.print(F("/")); n += 1;
-  ltoa(lround(PH_DOWN_MAX_ML_PER_HR), b2, 10);      lcd.print(b2); n += strlen(b2);
+  lcd.print(F(" mL")); n += 3;
+  while (n < LCD_COLS) lcd.print(' '), n++;
 
   // Row 3: last action
   lcd.setCursor(0, 3); n = 0;
@@ -795,18 +723,44 @@ static void lcd_screen_B() {
   lcd.print(F(" ")); n += 1;
   dtostrf(last_action_ml, 4, 1, b1); lcd.print(b1); n += strlen(b1);
   lcd.print(F("mL")); n += 2;
+  while (n < LCD_COLS) lcd.print(' '), n++;
+}
+
+static void lcd_screen_C() {
+  char b1[16], b2[16]; uint8_t n;
+  lcd.clear();
+
+  // Row 0: short title
+  lcd.setCursor(0, 0); n = 0;
+  lcd.print(F("pHD mL/h")); n = LCD_COLS;
+
+  // Row 1: pH-Down used/cap (shorthand)
+  lcd.setCursor(0, 1); n = 0;
+  lcd.print(F("pHD: ")); n += 5;
+  dtostrf(ph_down_dosed_this_window, 0, 1, b1); lcd.print(b1); n += strlen(b1);
+  lcd.print(F("/")); n += 1;
+  dtostrf(PH_DOWN_MAX_ML_PER_HR,     0, 1, b2); lcd.print(b2); n += strlen(b2);
+  while (n < LCD_COLS) lcd.print(' '), n++;
+
+  // Row 2: setpoint and deadband (shorthand)
+  lcd.setCursor(0, 2); n = 0;
+  lcd.print(F("SP:")); n += 3;
+  dtostrf(PH_SETPOINT, 3, 1, b1); lcd.print(b1); n += strlen(b1);
+  lcd.print(F("  DB:")); n += 5;
+  dtostrf(PH_DEADBAND, 3, 2, b2); lcd.print(b2); n += strlen(b2);
+  while (n < LCD_COLS) lcd.print(' '), n++;
+
+  // Row 3: EMA factor (shorthand)
+  lcd.setCursor(0, 3); n = 0;
+  lcd.print(F("EMA a=")); n += 6;
+  dtostrf(PH_CONTROL_EMA, 3, 2, b1); lcd.print(b1); n += strlen(b1);
+  while (n < LCD_COLS) lcd.print(' '), n++;
 }
 
 /* ============================================================
  * ESP8266 bridge — compact CSV for HA/MQTT
  * ============================================================ */
 
-/**
- * @brief Emit a compact CSV line for telemetry.
- *
- * Fields:
- *   PH_RAW,PH_C,EC,T,PH_SP,EC_SP,PH_ERR,EC_ERR,A_HR,B_HR,ECD_HR,PHD_HR,LAST,LAST_ML,UPTIME_MS
- */
 static void send_line_to_esp8266() {
   const bool ph_ok = !(isnan(ph_control) || ph_control < 0.0 || ph_control > 14.0);
   const bool t_ok  = !(isnan(water_temperature) || water_temperature < -50.0 || water_temperature > 125.0);
@@ -827,7 +781,7 @@ static void send_line_to_esp8266() {
   Serial1.print(F(",A_HR,"));     Serial1.print(lround(ec_a_dosed_this_window));
   Serial1.print(F(",B_HR,"));     Serial1.print(lround(ec_b_dosed_this_window));
   Serial1.print(F(",ECD_HR,"));   Serial1.print(lround(ec_down_dosed_this_window));
-  Serial1.print(F(",PHD_HR,"));   Serial1.print(lround(ph_down_dosed_this_window));
+  Serial1.print(F(",PHD_HR,"));   Serial1.print(ph_down_dosed_this_window, 1); // 0.1 mL precision
   Serial1.print(F(",LAST,"));     Serial1.print(last_action);
   Serial1.print(F(",LAST_ML,"));  Serial1.print(last_action_ml, 1);
   Serial1.print(F(",UPTIME_MS,"));Serial1.print(millis());
