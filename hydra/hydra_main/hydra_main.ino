@@ -93,7 +93,6 @@ static const double PH_DEADBAND = 0.15;
 static const double EC_DEADBAND = 50.0;      // µS/cm
 
 // EC temperature compensation coefficient (fraction/°C relative to 25 °C)
-// Typical value ≈ 0.02/°C for many solutions; adjust if you have a lab coefficient.
 static const double ALPHA = 0.02;
 
 // pH control smoothing (EMA factor α ∈ [0,1])
@@ -187,9 +186,6 @@ static double last_action_ml = 0.0;
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Kick the watchdog and yield so long loops don’t trigger resets.
- */
 static inline void watchdog_kick() {
   #if defined(ARDUINO_ARCH_AVR)
     wdt_reset();
@@ -197,10 +193,6 @@ static inline void watchdog_kick() {
   yield();
 }
 
-/**
- * @brief Safe delay that remains responsive to the watchdog.
- * @param ms Milliseconds to wait.
- */
 static void safe_delay(unsigned long ms) {
   const unsigned long start = millis();
   while ((millis() - start) < ms) {
@@ -211,7 +203,6 @@ static void safe_delay(unsigned long ms) {
 
 /* ────────────────────────────────────────────────────────────
  *                  FORWARD DECLARATIONS
- *   Keep a clear index of what exists below for easy navigation.
  * ────────────────────────────────────────────────────────────
  */
 static void initialise_pins();
@@ -256,7 +247,6 @@ void setup() {
   Serial1.begin(115200);  // ESP8266 bridge for telemetry
 
   Wire.begin();
-  // Defensive I²C timeouts. TWOWIRE_HAS_TIMEOUT present on many cores.
   #if defined(TWOWIRE_HAS_TIMEOUT)
     Wire.setWireTimeout(25000, true);
   #elif defined(ARDUINO_ARCH_AVR)
@@ -291,34 +281,20 @@ void loop() {
 
   const unsigned long now = millis();
 
-  // Sample sensors and run control policy at a fixed cadence
   if (now - previous_millis >= SENSOR_INTERVAL) {
     previous_millis = now;
 
-    // 1) Temperature (used for display; EC compensation is pinned in EZO at 25 °C)
-    read_water_temperature();
-
-    // 2) Quiet the EZO-EC before taking pH to reduce cross-noise on the ADC
-    send_command(EC_PROBE_ADDRESS, "Sleep");
+    read_water_temperature();           // 1) T
+    send_command(EC_PROBE_ADDRESS, "Sleep"); // 2) Quiet EC before pH
     safe_delay(500);
-
-    // 3) pH first
-    read_ph_sensor();
-
-    // 4) Trigger an EC measurement and wait for data to be ready
-    send_command(EC_PROBE_ADDRESS, "R");
+    read_ph_sensor();                   // 3) pH
+    send_command(EC_PROBE_ADDRESS, "R");     // 4) Trigger EC
     safe_delay(600);
+    read_ec_sensor();                   // 5) Parse EC
+    send_command(EC_PROBE_ADDRESS, "Status"); // 6) Keep EC awake
+    control_loop();                     // 7) Control
 
-    // 5) Parse the EC response and apply software compensation if needed
-    read_ec_sensor();
-
-    // 6) Keep EC awake so the next cycle can start faster
-    send_command(EC_PROBE_ADDRESS, "Status");
-
-    // 7) Apply EC-first → then pH control logic with lockouts and hourly caps
-    control_loop();
-
-    // 8) Debug snapshot on USB serial
+    // Debug snapshot
     Serial.print(F("Snapshot | pHraw: "));
     Serial.print(ph_raw, 2);
     Serial.print(F(" | pHc: "));
@@ -329,11 +305,10 @@ void loop() {
     Serial.print(water_temperature, 1);
     Serial.println(F(" C"));
 
-    // 9) Telemetry to ESP8266 as a compact CSV line
-    send_line_to_esp8266();
+    send_line_to_esp8266();             // 8) CSV telemetry
   }
 
-  // LCD page rotation on a fixed schedule
+  // UI cadence
   if (now - last_page_ms >= LCD_PAGE_MS) {
     last_page_ms = now;
     lcd_page = (lcd_page + 1) % 3;
@@ -342,13 +317,11 @@ void loop() {
     update_lcd();
   }
 
-  // In-page numeric refresh (labels are not redrawn unless the page flips)
   if (now - last_lcd_ms >= LCD_UPDATE_MS) {
     last_lcd_ms = now;
     update_lcd();
   }
 
-  // Periodic LCD keep-alive to recover from rare I²C bus stalls (no splash to avoid blink)
   if (now - last_lcd_reinit_ms >= LCD_REINIT_MS) {
     initialise_display(false);
     last_lcd_reinit_ms = now;
@@ -356,11 +329,10 @@ void loop() {
     update_lcd();
   }
 
-  // Handle deferred EC B dose when its stagger timer expires
+  // Deferred EC-B
   if (pending_B && now >= pending_B_ready_ms) {
     if ((now - last_dose_ms_ec_cycle) >= EC_UP_MIX_LOCKOUT_MS) {
-      // If the A-dose lockout window has elapsed, drop the pending B for safety
-      pending_B = false;
+      pending_B = false; // expired safely
     } else if (ec_b_dosed_this_window < EC_B_MAX_ML_PER_HR && pending_B_ml > 0.0) {
       dose_nutrient_B(pending_B_ml);
       ec_b_dosed_this_window += pending_B_ml;
@@ -374,23 +346,16 @@ void loop() {
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Configure GPIO directions.
- */
 static void initialise_pins() {
   pinMode(PH_ANALOG_PIN, INPUT);
 }
 
-/**
- * @brief Start libraries, pin EC temperature to 25.0 °C, and confirm readback.
- *        Pinning EC temp removes a source of drift if your probe lacks RTD wiring.
- */
 static void initialise_devices() {
   ph_sensor.begin();
   waterTemp.begin();
   Serial.println(F("Devices initialised."));
 
-  // Lock the EZO-EC temperature to 25.0 °C and verify it answered
+  // Pin the EZO-EC temperature to 25.0 °C and verify readback
   send_command(EC_PROBE_ADDRESS, "T,25.0");
   safe_delay(300);
   char tbuf[32];
@@ -398,16 +363,12 @@ static void initialise_devices() {
   size_t n = read_response_ascii(EC_PROBE_ADDRESS, tbuf, sizeof(tbuf));
   if (n > 0) {
     Serial.print(F("EZO-EC temperature readback: "));
-    Serial.println(tbuf); // Example: "?T,25.0"
+    Serial.println(tbuf); // e.g. "?T,25.0"
   } else {
     Serial.println(F("EZO-EC temperature readback: no response"));
   }
 }
 
-/**
- * @brief Initialise the LCD and optionally show a short splash.
- * @param showSplash When true, prints a brief splash once at boot.
- */
 static void initialise_display(bool showSplash) {
   lcd.init();
   lcd.noBlink();
@@ -417,14 +378,13 @@ static void initialise_display(bool showSplash) {
   lcd.backlight();
   lcd.clear();
   if (showSplash) {
-    // 20-character padded lines to avoid ghosting
+    // 20-char padded splash
     lcd.setCursor(0, 0); lcd.print(F("Hydro Controller   "));
     lcd.setCursor(0, 1); lcd.print(F("Init...            "));
     safe_delay(400);
     lcd.clear();
   }
-  // Force the next update to print static labels again
-  lcd_full_redraw = true;
+  lcd_full_redraw = true; // Force label redraw on next update
 }
 
 /* ────────────────────────────────────────────────────────────
@@ -432,30 +392,18 @@ static void initialise_display(bool showSplash) {
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Read DS18B20 water temperature.
- * @return °C. Returns last value if the reading is implausible.
- */
 static double read_water_temperature() {
   waterTemp.requestTemperatures();
   const double t = waterTemp.getTempCByIndex(0);
-  if (t < -50.0 || t > 125.0) return water_temperature; // reject nonsense
+  if (t < -50.0 || t > 125.0) return water_temperature; // reject implausible read
   water_temperature = t;
   return water_temperature;
 }
 
-/**
- * @brief Measure pH and update the EMA control value.
- * @note  The DFRobot library expects milli-volts and temperature.
- * @return Raw instantaneous pH.
- */
 static double read_ph_sensor() {
-  // Use 1024.0 for AVR boards to stay compatible with older codepaths
   const double voltage_mV = (analogRead(PH_ANALOG_PIN) / 1024.0) * ANALOG_REF_MV;
   ph_raw = ph_sensor.readPH(voltage_mV, water_temperature);
 
-  // Exponential Moving Average for control stability:
-  //   ph_c(k) = α * ph_raw(k) + (1-α) * ph_c(k-1)
   const double a = constrain(PH_CONTROL_EMA, 0.0, 1.0);
   if (isnan(ph_control)) ph_control = ph_raw; // seed EMA
   else ph_control = a * ph_raw + (1.0 - a) * ph_control;
@@ -463,33 +411,22 @@ static double read_ph_sensor() {
   return ph_raw;
 }
 
-/**
- * @brief Parse the EC numeric response from the EZO-EC after an earlier "R".
- *        Holds the last good value to mask occasional transient zeros on the bus.
- * @return Compensated EC (µS/cm).
- */
+// Parses the already-ready EC frame triggered in loop()
 static double read_ec_sensor() {
   const double raw = read_response_ec_numeric(EC_PROBE_ADDRESS);
   if (raw > 0.0) {
     ec_last_good = compensate_ec(raw, water_temperature);
     ec_value = ec_last_good;
   } else if (!isnan(ec_last_good)) {
-    ec_value = ec_last_good;  // Keep UI/CSV stable through a bad frame
+    ec_value = ec_last_good;  // mask transient zero on UI/CSV
   } else {
     ec_value = 0.0;
   }
   return ec_value;
 }
 
-/**
- * @brief Apply linear temperature compensation to EC.
- * @param ec_measured EC measured at current temperature (µS/cm).
- * @param temperature Current water temperature (°C).
- * @return EC normalised to 25 °C (µS/cm).
- */
 static double compensate_ec(double ec_measured, double temperature) {
   const double T_REF = 25.0;
-  // EC_25 = EC_T / [1 + α*(T-25)]
   return ec_measured / (1.0 + ALPHA * (temperature - T_REF));
 }
 
@@ -498,10 +435,6 @@ static double compensate_ec(double ec_measured, double temperature) {
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Send a short ASCII command with limited retries.
- * @return True if Wire.endTransmission() returned success.
- */
 static bool i2c_send_with_retries(uint8_t address, const char* command, uint8_t max_attempts) {
   for (uint8_t attempt = 0; attempt < max_attempts; ++attempt) {
     Wire.beginTransmission(address);
@@ -515,28 +448,21 @@ static bool i2c_send_with_retries(uint8_t address, const char* command, uint8_t 
   return false;
 }
 
-/**
- * @brief Convenience wrapper to send a command then dwell briefly.
- */
 static void send_command(uint8_t address, const char *command) {
   if (!i2c_send_with_retries(address, command, 3)) {
     Serial.print(F("I2C send failed permanently to 0x"));
     Serial.println(address, HEX);
   }
-  safe_delay(300); // Allow device processing time
+  safe_delay(300); // device processing time
 }
 
-/**
- * @brief Read an EZO numeric response into a float (as ASCII).
- * @return atof() of the payload or 0.0 on error.
- */
 static float read_response_ec_numeric(uint8_t address) {
   const uint8_t bytes = Wire.requestFrom(address, (uint8_t)32);
   if (bytes == 0) {
     Serial.print(F("I2C read error from 0x")); Serial.println(address, HEX);
     return 0.0f;
   }
-  const uint8_t status = Wire.read(); (void)status; // 1=OK, 254=pending (we already waited)
+  const uint8_t status = Wire.read(); (void)status; // 1=OK, 254=pending
   char buf[31]; uint8_t i = 0;
   while (Wire.available() && i < sizeof(buf) - 1) {
     const char c = Wire.read();
@@ -546,10 +472,6 @@ static float read_response_ec_numeric(uint8_t address) {
   return atof(buf);
 }
 
-/**
- * @brief Read an ASCII response into a caller buffer (for diagnostics).
- * @return Number of characters copied.
- */
 static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen) {
   if (!buf || buflen == 0) return 0;
   const uint8_t bytes = Wire.requestFrom(address, (uint8_t)32);
@@ -566,14 +488,9 @@ static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen) {
 
 /* ────────────────────────────────────────────────────────────
  *                        DOSING PRIMITIVES
- *   These functions only send pump commands and update “last action”.
- *   Hourly caps and lockouts are enforced in control_loop().
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Dose Nutrient A (EC Up part A).
- */
 static void dose_nutrient_A(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -582,9 +499,6 @@ static void dose_nutrient_A(double ml) {
   strcpy(last_action, "A"); last_action_ml = ml;
 }
 
-/**
- * @brief Dose Nutrient B (EC Up part B).
- */
 static void dose_nutrient_B(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -593,9 +507,6 @@ static void dose_nutrient_B(double ml) {
   strcpy(last_action, "B"); last_action_ml = ml;
 }
 
-/**
- * @brief Dose EC Down channel (typically water).
- */
 static void dose_ec_down(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -604,9 +515,6 @@ static void dose_ec_down(double ml) {
   strcpy(last_action, "ECD"); last_action_ml = ml;
 }
 
-/**
- * @brief Dose pH Down channel (acid).
- */
 static void dose_ph_down(double ml) {
   if (ml <= 0.0) return;
   String cmd = "D," + String(ml, 2);
@@ -620,22 +528,16 @@ static void dose_ph_down(double ml) {
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Implements the staged control policy:
- *        1) Correct EC into deadband (Up or Down). Defer pH while EC is busy.
- *        2) After EC settles for its mix window, apply pH Down as needed.
- *        Safety via per-channel hourly caps and per-action lockouts.
- */
 static void control_loop() {
   const unsigned long now = millis();
   maybe_reset_hourly_caps();
 
   const bool ph_ok = !(isnan(ph_control) || ph_control < 0.0 || ph_control > 14.0);
 
-  // ── Stage 1: EC priority
-  const double ec_err = EC_SETPOINT - ec_value;   // positive → EC low → need Up; negative → high → need Down
+  // Stage 1: EC priority
+  const double ec_err = EC_SETPOINT - ec_value;   // +low→Up, −high→Down
   const bool   ec_in_range   = fabs(ec_err) <= EC_DEADBAND;
-  const bool   ec_cycle_busy = pending_B;        // B still pending means EC is mid-cycle
+  const bool   ec_cycle_busy = pending_B;
 
   if (!ec_in_range || ec_cycle_busy) {
     if (!ec_cycle_busy) {
@@ -645,10 +547,8 @@ static void control_loop() {
       const unsigned long last_ms = need_ec_down ? last_dose_ms_ec_down
                                                  : last_dose_ms_ec_cycle;
 
-      // Mix window cleared → allowed to consider a new EC action
       if ((now - last_ms) >= required_lockout) {
         if (need_ec_down) {
-          // EC Down path (often disabled by setting EC_DOWN_DOSE_ML = 0.0)
           if (EC_DOWN_DOSE_ML > 0.0 && ec_down_dosed_this_window < EC_DOWN_MAX_ML_PER_HR) {
             const double room = EC_DOWN_MAX_ML_PER_HR - ec_down_dosed_this_window;
             const double dose = min(EC_DOWN_DOSE_ML, room);
@@ -660,7 +560,6 @@ static void control_loop() {
             }
           }
         } else {
-          // EC Up path: split the configured total dose into A and B by ratio
           const double ratioA = EC_A_TO_B_RATIO;
           const double a_part = (ratioA / (ratioA + 1.0)) * EC_UP_TOTAL_DOSE_ML;
           const double b_part = EC_UP_TOTAL_DOSE_ML - a_part;
@@ -668,12 +567,10 @@ static void control_loop() {
           const double a_room = max(0.0, EC_A_MAX_ML_PER_HR - ec_a_dosed_this_window);
           const double b_room = max(0.0, EC_B_MAX_ML_PER_HR - ec_b_dosed_this_window);
 
-          // Only proceed if both parts fit inside their hourly caps
           if (a_part > 0.0 && b_part > 0.0 && a_room >= a_part && b_room >= b_part) {
             dose_nutrient_A(a_part);
             ec_a_dosed_this_window += a_part;
 
-            // Schedule B for later to allow partial mixing
             pending_B = true;
             pending_B_ml = b_part;
             pending_B_ready_ms = now + EC_AB_STAGGER_MS;
@@ -684,11 +581,10 @@ static void control_loop() {
         }
       }
     }
-    // While EC is not in range or is mid-cycle, pH adjustments are deferred.
-    return;
+    return; // Defer pH until EC is stable/in-range
   }
 
-  // ── Stage 2: pH phase after EC has settled for the appropriate window
+  // Stage 2: pH after EC settles
   const unsigned long ec_required_settle =
       (last_ec_direction < 0) ? EC_DOWN_MIX_LOCKOUT_MS :
       (last_ec_direction > 0) ? EC_UP_MIX_LOCKOUT_MS   : 0UL;
@@ -697,7 +593,7 @@ static void control_loop() {
   const bool ec_has_settled = (millis() - last_ec_any) >= ec_required_settle;
 
   if (ph_ok && ec_has_settled) {
-    const double ph_err = PH_SETPOINT - ph_control; // negative → pH above setpoint → need Down
+    const double ph_err = PH_SETPOINT - ph_control; // negative → need pH Down
     const bool need_ph_down = (fabs(ph_err) > PH_DEADBAND && ph_err < 0.0);
 
     if (need_ph_down) {
@@ -722,10 +618,6 @@ static void control_loop() {
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Roll the 1-hour accounting windows to enforce ml/h caps.
- *        Simple “bucket” reset once per device hour per channel.
- */
 static void maybe_reset_hourly_caps() {
   const unsigned long now = millis();
   const unsigned long HOUR_MS = 3600000UL;
@@ -741,17 +633,10 @@ static void maybe_reset_hourly_caps() {
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Pad spaces to the end of line so each row is exactly 20 chars.
- */
 static void lcd_pad_to_eol(uint8_t n) {
   while (n < LCD_COLS) { lcd.print(' '); n++; }
 }
 
-/**
- * @brief Print exactly 20 characters. Pads or truncates as needed.
- *        This guarantees fixed-width rows which prevents label creep/overlap.
- */
 static void print_row20(const char* s) {
   char buf[21];
   size_t len = strnlen(s, 20);
@@ -763,40 +648,35 @@ static void print_row20(const char* s) {
 
 /* ────────────────────────────────────────────────────────────
  *                           LCD UI PAGES
- *   Page A prints Row0 and Row2 as single strings each update
- *   to guarantee spacing: no “butting” of labels and numbers.
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Drive the LCD: decide which page to render and whether to redraw labels.
- */
 static void update_lcd() {
   const bool full = page_changed || (lcd_page != prev_page);
   if (full) {
-    lcd.clear();               // Single clear at flip or after re-init
+    lcd.clear();
     prev_page = lcd_page;
     page_changed = false;
-    lcd_full_redraw = true;    // Force label redraw on this page
+    lcd_full_redraw = true;
   }
   switch (lcd_page) {
-    case 0: lcd_screen_A(); break;  // Overview
-    case 1: lcd_screen_B(); break;  // Hourly totals vs caps
-    default: lcd_screen_C(); break; // Last action + uptime
+    case 0: lcd_screen_A(); break;
+    case 1: lcd_screen_B(); break;
+    default: lcd_screen_C(); break;
   }
 }
 
 /**
- * @brief Page A — Overview
- * Row 0: "pHc:%5.2f  pHr:%5.2f" (exactly 20 chars after padding)
+ * Page A — Overview
+ * Row 0: "pHc:%5.2f  pHr:%5.2f"
  * Row 1: "pH SP:<value>"
- * Row 2: "EC:%6ld  SP:%5ld"    (integers; fixed widths to avoid collision)
- * Row 3: "T:<xx.x> C"
+ * Row 2: "EC:%6ld  SP:%5ld"
+ * Row 3: "T: <xx.x> C"  ← note the space after the colon; value starts at column 3.
  */
 static void lcd_screen_A() {
   char cbuf[6], rbuf[6], row0[32], row2[32], b1[16];
 
-  // Row 0: pH control value and raw value rendered as one fixed-width line
+  // Row 0: pH control and raw as one fixed-width line
   dtostrf(isnan(ph_control) ? ph_raw : ph_control, 5, 2, cbuf);
   dtostrf(ph_raw, 5, 2, rbuf);
   snprintf(row0, sizeof(row0), "pHc:%s  pHr:%s", cbuf, rbuf);
@@ -806,16 +686,16 @@ static void lcd_screen_A() {
   if (lcd_full_redraw) {
     // Row 1 scaffold: pH SP label with a reserved value slot
     lcd.setCursor(0,1); lcd.print(F("pH SP:           ")); // value at col 7..10
-    // Row 3 scaffold: temperature line (unit printed once)
+    // Row 3 scaffold: temperature line; leave at least one space after "T:"
     lcd.setCursor(0,3); lcd.print(F("T:     C          "));
     lcd_full_redraw = false;
   }
 
   // Row 1 value: pH setpoint
-  dtostrf(PH_SETPOINT, 4, 1, b1);   // e.g. " 5.8"
+  dtostrf(PH_SETPOINT, 4, 1, b1);
   lcd.setCursor(7,1);  lcd.print(b1);
 
-  // Row 2: EC current and setpoint printed as one fixed-width line
+  // Row 2: EC current and setpoint rendered as one fixed-width line
   long ec_cur = lround(ec_value);
   long ec_sp  = lround(EC_SETPOINT);
   snprintf(row2, sizeof(row2), "EC:%6ld  SP:%5ld", ec_cur, ec_sp);
@@ -823,13 +703,13 @@ static void lcd_screen_A() {
   print_row20(row2);
 
   // Row 3 value: water temperature
-  dtostrf(water_temperature, 4, 1, b1); // e.g. "23.4"
-  lcd.setCursor(2,3);  lcd.print(b1);
+  dtostrf(water_temperature, 4, 1, b1);
+  lcd.setCursor(3,3);  // start at column 3, so "T:" then a space, then the number
+  lcd.print(b1);
 }
 
 /**
- * @brief Page B — Hourly totals vs caps (units intentionally omitted).
- * Layout fits within 20 chars per row, left-aligned, padded to EOL.
+ * Page B — Hourly totals vs caps (units intentionally omitted).
  */
 static void lcd_screen_B() {
   char b1[16], b2[16]; uint8_t n = 0;
@@ -858,7 +738,7 @@ static void lcd_screen_B() {
   ltoa(lround(EC_DOWN_MAX_ML_PER_HR), b2, 10);     lcd.print(b2); n += strlen(b2);
   lcd_pad_to_eol(n);
 
-  // Row 3: pH Down hourly (one decimal for more resolution at small volumes)
+  // Row 3: pH Down hourly
   lcd.setCursor(0, 3); n = 0;
   lcd.print(F("pH Dn: ")); n += 7;
   dtostrf(ph_down_dosed_this_window, 0, 1, b1); lcd.print(b1); n += strlen(b1);
@@ -868,8 +748,7 @@ static void lcd_screen_B() {
 }
 
 /**
- * @brief Page C — Operational status: last action and uptime.
- * Uptime shown in hours with one decimal. Rows 1–2 left intentionally blank.
+ * Page C — Operational status: last action and uptime.
  */
 static void lcd_screen_C() {
   char b1[16]; uint8_t n = 0;
@@ -901,11 +780,6 @@ static void lcd_screen_C() {
  * ────────────────────────────────────────────────────────────
  */
 
-/**
- * @brief Emit one compact CSV line per sample for logging/telemetry.
- * Fields include raw and control pH, EC, temperature, setpoints, errors,
- * hourly dosed amounts, last action, and uptime.
- */
 static void send_line_to_esp8266() {
   const bool ph_ok = !(isnan(ph_control) || ph_control < 0.0 || ph_control > 14.0);
   const bool t_ok  = !(isnan(water_temperature) || water_temperature < -50.0 || water_temperature > 125.0);
