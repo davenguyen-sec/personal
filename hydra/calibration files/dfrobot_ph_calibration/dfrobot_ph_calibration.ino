@@ -21,7 +21,7 @@
 #include <EEPROM.h>
 
 #define PH_PIN A5
-float voltage,phValue,temperature = 25;
+float voltage,phValue,temperature = 24.13;
 DFRobot_PH ph;
 
 void setup()

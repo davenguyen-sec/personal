@@ -108,12 +108,12 @@ static const unsigned long EC_AB_STAGGER_MS = 120000UL; // Wait time between A a
 static const double EC_DOWN_DOSE_ML = 0.0;
 
 // pH Down per-dose
-static const double PH_DOWN_DOSE_ML = 0.5;
+static const double PH_DOWN_DOSE_ML = 1.0;
 
 // Mix/settle lockouts to avoid dosing into an unmixed reservoir
 static const unsigned long EC_UP_MIX_LOCKOUT_MS   = 600000UL; // 10 min after any EC Up action
 static const unsigned long EC_DOWN_MIX_LOCKOUT_MS = 600000UL; // 10 min after any EC Down action
-static const unsigned long PH_DOWN_MIX_LOCKOUT_MS = 900000UL; // 15 min after any pH Down action
+static const unsigned long PH_DOWN_MIX_LOCKOUT_MS = 1800000UL; // 15 min after any pH Down action
 
 // Hourly caps to bound chemical addition rates (ml per hour)
 static const double  EC_A_MAX_ML_PER_HR    = 40.0;
