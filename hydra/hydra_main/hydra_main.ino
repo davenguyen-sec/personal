@@ -457,7 +457,7 @@ static double read_ec_sensor() {
   if (raw >= 0.0 && raw < 1000000.0) {
     const double compensated = compensate_ec(raw, water_temperature);
 
-    if (compensated > 0.0 && compensated < 1000000.0) {
+    if (compensated >= 0.0 && compensated < 1000000.0) {
       ec_last_good = compensated;
       ec_value = compensated;
       ec_read_valid = true;
