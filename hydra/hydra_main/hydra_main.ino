@@ -1,43 +1,40 @@
 /**
  * @file    hydra_main.ino
- * @brief   Hydroponics controller with EC-first dosing and EMA-smoothed pH control.
- *          20×4 I²C LCD UI with fixed-width rows that avoid flicker and label creep.
+ * @brief   Main Arduino Mega hydroponics controller.
  *
- * @details
- * System overview
- *  - Sensors:
- *      • pH probe via DFRobot_PH library (analogue read -> volts -> pH).
- *      • DS18B20 water temperature for display and EC compensation reference checks.
- *      • Atlas Scientific EZO-EC in I²C mode for EC. Probe is kept “awake” between cycles.
- *  - Actuators (I²C slave pump controllers; addresses below):
- *      • Nutrient A (EC Up part A), Nutrient B (EC Up part B), EC Down (water), pH Down.
- *  - Control policy:
- *      1) EC is corrected first. pH control is deferred until EC is within a deadband and the
- *         solution has had time to mix and settle (separate lockouts for EC Up/Down).
- *      2) pH control uses an exponential moving average (EMA) of pH (“ph_control”) to reduce
- *         noise-driven dosing. Raw pH (“ph_raw”) is still displayed for visibility.
- *  - Safety:
- *      • Per-action mix/settle lockouts to avoid stacking doses into unmixed solution.
- *      • Hourly ml/h caps per channel to bound maximum chemical addition.
- *      • “Last valid EC” hold to hide transient 0 reads on the UI/telemetry.
- *  - Telemetry:
- *      • One CSV line per sample on Serial1 for ESP8266 bridging (Home Assistant/MQTT).
- *  - LCD UI (2004A @ 0x27):
- *      • Three pages rotated on a fixed schedule. Labels drawn once per page to prevent flicker.
- *      • Critical rows (Row0 pH and Row2 EC) are rendered as single 20-char strings each refresh
- *        to prevent values and labels “butting” into each other.
+ * The Mega reads pH, water temperature, and EC; makes EC-first dosing decisions;
+ * drives four I²C pump controllers; updates a 20x4 LCD; and sends CSV telemetry to
+ * an ESP8266 over Serial1 for MQTT/Home Assistant.
  *
- * Units and locale
- *  - Metric units. EC displayed as µS/cm (label omitted to fit 20-col layout cleanly).
- *  - Temperatures in °C. Australia/Sydney timezone is irrelevant here; uptime is device-local.
+ * CONTROL ORDER
+ *  1. Read water temperature.
+ *  2. Quiet the EZO-EC probe, then read pH.
+ *  3. Request and read EC.
+ *  4. If the latest EC reading is valid, run EC control first.
+ *  5. Only when EC is in range and settled may pH-down control run.
  *
- * Editing guidance
- *  - To tune responsiveness vs stability, adjust:
- *      • PH_CONTROL_EMA ∈ [0,1]: higher → faster reaction, lower → smoother control signal.
- *      • *_DEADBAND: widen to reduce chatter, narrow to track setpoint more tightly.
- *      • *_MIX_LOCKOUT_MS: increase if your reservoir mixes slowly.
- *      • *_MAX_ML_PER_HR: safety envelope for each channel.
- *  - Any change that affects row widths must keep the 20-character guarantee on the LCD helpers.
+ * IMPORTANT SAFETY RULES
+ *  - A failed/invalid EC read may still leave the last good EC value on the LCD and
+ *    telemetry, but that stale value is NEVER allowed to authorise dosing.
+ *  - If the latest EC measurement is invalid, all new dosing is inhibited until a
+ *    fresh valid EC measurement is obtained.
+ *  - A pump dose is counted only when its I²C command is successfully acknowledged.
+ *    Failed pump transmissions do not change dose totals, lockout timestamps, or
+ *    last-action state, and a failed Nutrient-A command does not schedule Nutrient-B.
+ *  - Mix/settle lockouts prevent repeated dosing into an unmixed reservoir.
+ *  - Hourly per-channel limits bound the commanded chemical volume.
+ *
+ * DISPLAY / TELEMETRY
+ *  - The LCD rotates through three pages. Fixed-width rendering avoids flicker and
+ *    leftover characters from previous values.
+ *  - Serial1 emits one key/value CSV line per sensor cycle for the ESP8266 bridge.
+ *  - EC is in uS/cm and temperature is in degrees C.
+ *
+ * TUNING
+ *  - PH_CONTROL_EMA: higher = faster response; lower = more smoothing.
+ *  - *_DEADBAND: wider = less chatter; narrower = tighter tracking.
+ *  - *_MIX_LOCKOUT_MS: increase if the reservoir mixes slowly.
+ *  - *_MAX_ML_PER_HR: maximum commanded volume per hourly reset window.
  */
 
 #include <Arduino.h>
@@ -103,6 +100,7 @@ static const double PH_CONTROL_EMA = 0.20;
 static const double EC_UP_TOTAL_DOSE_ML = 8.0;
 static const double EC_A_TO_B_RATIO     = 1.0;        // 1:1 split between A and B
 static const unsigned long EC_AB_STAGGER_MS = 120000UL; // Wait time between A and B (mix window)
+static const unsigned long EC_B_RETRY_MS      = 5000UL;   // Delay before retrying a failed B command
 
 // EC Down (water) per-dose; set 0.0 to disable automatic EC down-dosing
 static const double EC_DOWN_DOSE_ML = 0.0;
@@ -113,7 +111,7 @@ static const double PH_DOWN_DOSE_ML = 1.0;
 // Mix/settle lockouts to avoid dosing into an unmixed reservoir
 static const unsigned long EC_UP_MIX_LOCKOUT_MS   = 600000UL; // 10 min after any EC Up action
 static const unsigned long EC_DOWN_MIX_LOCKOUT_MS = 600000UL; // 10 min after any EC Down action
-static const unsigned long PH_DOWN_MIX_LOCKOUT_MS = 1800000UL; // 15 min after any pH Down action
+static const unsigned long PH_DOWN_MIX_LOCKOUT_MS = 1800000UL; // 30 min after any pH Down action
 
 // Hourly caps to bound chemical addition rates (ml per hour)
 static const double  EC_A_MAX_ML_PER_HR    = 40.0;
@@ -135,11 +133,13 @@ OneWire oneWire(DS18B20_PIN);
 DallasTemperature waterTemp(&oneWire);
 LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLS, LCD_ROWS);
 
-// Live measurements
+// Live sensor values. ec_value may hold the last good reading for display, while
+// ec_read_valid tells the control logic whether the MOST RECENT EC cycle succeeded.
 static double ph_raw = 0.0;          // Instantaneous pH from the probe
 static double ph_control = NAN;      // EMA-smoothed pH used for control
-static double ec_value = 0.0;        // Temperature-compensated EC (µS/cm)
-static double ec_last_good = NAN;    // Last valid EC to mask transient zeros
+static double ec_value = 0.0;        // Current display/telemetry EC value (uS/cm)
+static double ec_last_good = NAN;    // Last successfully measured, compensated EC
+static bool   ec_read_valid = false; // True only when the latest EC measurement succeeded
 static double water_temperature = 0.0;
 
 // Timing state
@@ -154,12 +154,14 @@ static bool page_changed = false;
 static uint8_t prev_page = 255;
 static bool lcd_full_redraw = true;  // True → print static labels; False → update numbers only
 
-// EC dosing state
-static unsigned long last_dose_ms_ec_cycle = 0; // Time of last EC Up action (A dose)
+// EC dosing state. last_dose_ms_ec_cycle marks the accepted Nutrient-A command
+// that started the current two-part EC-up cycle.
+static unsigned long last_dose_ms_ec_cycle = 0;
 static unsigned long last_dose_ms_ec_down  = 0; // Time of last EC Down dose
 static int last_ec_direction = 0;               // +1 Up, −1 Down, 0 none
 
-// Deferred EC B dose (staggered after A)
+// Deferred Nutrient-B dose. B is scheduled only after a successful A command
+// and remains pending until the configured A-to-B stagger has elapsed.
 static bool   pending_B = false;
 static double pending_B_ml = 0.0;
 static unsigned long pending_B_ready_ms = 0;
@@ -167,7 +169,8 @@ static unsigned long pending_B_ready_ms = 0;
 // pH dosing state
 static unsigned long last_dose_ms_ph_down = 0;
 
-// Hourly accounting windows
+// Hourly accounting windows. These totals represent pump commands that were
+// acknowledged on I2C; they are not independent physical-flow measurements.
 static unsigned long ec_a_window_start    = 0;
 static unsigned long ec_b_window_start    = 0;
 static unsigned long ec_down_window_start = 0;
@@ -177,7 +180,7 @@ static double ec_b_dosed_this_window    = 0.0;
 static double ec_down_dosed_this_window = 0.0;
 static double ph_down_dosed_this_window = 0.0;
 
-// Last action summary for UI
+// Last successfully acknowledged pump command shown on the LCD/telemetry
 static char   last_action[8] = "None"; // One of: "A","B","ECD","pHD","None"
 static double last_action_ml = 0.0;
 
@@ -215,14 +218,14 @@ static double read_ec_sensor();                 // Parses current EC frame after
 static double compensate_ec(double ec_measured, double temperature);
 
 static bool   i2c_send_with_retries(uint8_t address, const char* command, uint8_t max_attempts = 3);
-static void   send_command(uint8_t address, const char *command);
+static bool   send_command(uint8_t address, const char *command);
 static float  read_response_ec_numeric(uint8_t address);
 static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen);
 
-static void dose_nutrient_A(double ml);
-static void dose_nutrient_B(double ml);
-static void dose_ec_down(double ml);
-static void dose_ph_down(double ml);
+static bool dose_nutrient_A(double ml);
+static bool dose_nutrient_B(double ml);
+static bool dose_ec_down(double ml);
+static bool dose_ph_down(double ml);
 
 static void control_loop();
 static void maybe_reset_hourly_caps();
@@ -284,15 +287,35 @@ void loop() {
   if (now - previous_millis >= SENSOR_INTERVAL) {
     previous_millis = now;
 
-    read_water_temperature();           // 1) T
-    send_command(EC_PROBE_ADDRESS, "Sleep"); // 2) Quiet EC before pH
+    // 1) Temperature is used by the pH library and EC compensation.
+    read_water_temperature();
+
+    // 2) Quiet the EC circuit before reading the analogue pH input.
+    //    Failure here is logged but does not by itself authorize or block dosing.
+    send_command(EC_PROBE_ADDRESS, "Sleep");
     safe_delay(500);
-    read_ph_sensor();                   // 3) pH
-    send_command(EC_PROBE_ADDRESS, "R");     // 4) Trigger EC
+
+    // 3) Read pH.
+    read_ph_sensor();
+
+    // 4) Request a NEW EC conversion. Start each cycle as invalid so an old value
+    //    can never accidentally be treated as a fresh control measurement.
+    ec_read_valid = false;
+    const bool ec_request_ok = send_command(EC_PROBE_ADDRESS, "R");
     safe_delay(600);
-    read_ec_sensor();                   // 5) Parse EC
-    send_command(EC_PROBE_ADDRESS, "Status"); // 6) Keep EC awake
-    control_loop();                     // 7) Control
+
+    // 5) Only parse EC when the request itself was acknowledged.
+    if (ec_request_ok) {
+      read_ec_sensor();
+    } else {
+      Serial.println(F("EC request failed; dosing inhibited for this cycle."));
+    }
+
+    // 6) Status command is used to keep the EZO circuit awake between cycles.
+    send_command(EC_PROBE_ADDRESS, "Status");
+
+    // 7) control_loop() independently checks ec_read_valid before allowing dosing.
+    control_loop();
 
     // Debug snapshot
     Serial.print(F("Snapshot | pHraw: "));
@@ -301,6 +324,8 @@ void loop() {
     Serial.print(isnan(ph_control) ? ph_raw : ph_control, 2);
     Serial.print(F(" | EC: "));
     Serial.print(ec_value, 0);
+    Serial.print(F(" | ECvalid: "));
+    Serial.print(ec_read_valid ? F("Y") : F("N"));
     Serial.print(F(" | T: "));
     Serial.print(water_temperature, 1);
     Serial.println(F(" C"));
@@ -329,14 +354,24 @@ void loop() {
     update_lcd();
   }
 
-  // Deferred EC-B
+  // Deferred Nutrient-B dose.
+  // Safety rule: even a previously scheduled B dose waits while the latest EC
+  // measurement is invalid. If the pending window expires, it is cancelled.
   if (pending_B && now >= pending_B_ready_ms) {
     if ((now - last_dose_ms_ec_cycle) >= EC_UP_MIX_LOCKOUT_MS) {
-      pending_B = false; // expired safely
-    } else if (ec_b_dosed_this_window < EC_B_MAX_ML_PER_HR && pending_B_ml > 0.0) {
-      dose_nutrient_B(pending_B_ml);
-      ec_b_dosed_this_window += pending_B_ml;
       pending_B = false;
+      Serial.println(F("Pending B dose expired and was cancelled."));
+    } else if (!ec_read_valid) {
+      // Keep B pending. A later valid EC cycle may allow it to complete.
+    } else if (ec_b_dosed_this_window < EC_B_MAX_ML_PER_HR && pending_B_ml > 0.0) {
+      if (dose_nutrient_B(pending_B_ml)) {
+        // Count the dose only after the pump command was acknowledged.
+        ec_b_dosed_this_window += pending_B_ml;
+        pending_B = false;
+      } else {
+        // Avoid hammering a failed I2C device continuously from the fast main loop.
+        pending_B_ready_ms = millis() + EC_B_RETRY_MS;
+      }
     }
   }
 }
@@ -411,17 +446,35 @@ static double read_ph_sensor() {
   return ph_raw;
 }
 
-// Parses the already-ready EC frame triggered in loop()
+// Read the EC result requested earlier in loop().
+//
+// ec_value is allowed to retain the last good measurement for a stable display.
+// ec_read_valid is deliberately separate: control may dose ONLY when this flag
+// is true for the latest sensor cycle.
 static double read_ec_sensor() {
   const double raw = read_response_ec_numeric(EC_PROBE_ADDRESS);
-  if (raw > 0.0) {
-    ec_last_good = compensate_ec(raw, water_temperature);
+
+  if (raw > 0.0 && raw < 1000000.0) {
+    const double compensated = compensate_ec(raw, water_temperature);
+
+    if (compensated > 0.0 && compensated < 1000000.0) {
+      ec_last_good = compensated;
+      ec_value = compensated;
+      ec_read_valid = true;
+      return ec_value;
+    }
+  }
+
+  // Invalid current read: keep the old value for display/telemetry if available,
+  // but mark it unusable for control so stale EC can never trigger a new dose.
+  ec_read_valid = false;
+  if (!isnan(ec_last_good)) {
     ec_value = ec_last_good;
-  } else if (!isnan(ec_last_good)) {
-    ec_value = ec_last_good;  // mask transient zero on UI/CSV
   } else {
     ec_value = 0.0;
   }
+
+  Serial.println(F("EC read invalid; dosing inhibited for this cycle."));
   return ec_value;
 }
 
@@ -448,12 +501,19 @@ static bool i2c_send_with_retries(uint8_t address, const char* command, uint8_t 
   return false;
 }
 
-static void send_command(uint8_t address, const char *command) {
-  if (!i2c_send_with_retries(address, command, 3)) {
+// Send one I2C command and report whether the slave acknowledged the transfer.
+// A true result confirms I2C delivery only; it cannot prove that liquid physically moved.
+static bool send_command(uint8_t address, const char *command) {
+  const bool ok = i2c_send_with_retries(address, command, 3);
+
+  if (!ok) {
     Serial.print(F("I2C send failed permanently to 0x"));
     Serial.println(address, HEX);
+    return false;
   }
-  safe_delay(300); // device processing time
+
+  safe_delay(300); // Allow the receiving device time to process the command.
+  return true;
 }
 
 static float read_response_ec_numeric(uint8_t address) {
@@ -462,7 +522,18 @@ static float read_response_ec_numeric(uint8_t address) {
     Serial.print(F("I2C read error from 0x")); Serial.println(address, HEX);
     return 0.0f;
   }
-  const uint8_t status = Wire.read(); (void)status; // 1=OK, 254=pending
+  // Atlas EZO responses are usable for control only when status == 1 (success).
+  // Treat pending/error/no-data responses as an invalid EC cycle. This check is
+  // part of the fail-safe EC-validity gate above; it prevents a non-OK frame from
+  // being mistaken for a fresh EC measurement.
+  const uint8_t status = Wire.read();
+  if (status != 1) {
+    Serial.print(F("EZO-EC response status not OK: "));
+    Serial.println(status);
+    while (Wire.available()) Wire.read();
+    return 0.0f;
+  }
+
   char buf[31]; uint8_t i = 0;
   while (Wire.available() && i < sizeof(buf) - 1) {
     const char c = Wire.read();
@@ -491,36 +562,66 @@ static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen) {
  * ────────────────────────────────────────────────────────────
  */
 
-static void dose_nutrient_A(double ml) {
-  if (ml <= 0.0) return;
+// Each dosing primitive returns true only when its I2C command was acknowledged.
+// Counters, lockouts, and sequencing are updated by the caller only on true.
+static bool dose_nutrient_A(double ml) {
+  if (ml <= 0.0) return false;
+
   String cmd = "D," + String(ml, 2);
-  send_command(NUTRIENT_A_PUMP_ADDRESS, cmd.c_str());
-  Serial.print(F("Dose A (mL): ")); Serial.println(ml, 2);
-  strcpy(last_action, "A"); last_action_ml = ml;
+  if (!send_command(NUTRIENT_A_PUMP_ADDRESS, cmd.c_str())) {
+    Serial.println(F("Dose A command failed; dose NOT counted."));
+    return false;
+  }
+
+  Serial.print(F("Dose A command accepted (mL): ")); Serial.println(ml, 2);
+  strcpy(last_action, "A");
+  last_action_ml = ml;
+  return true;
 }
 
-static void dose_nutrient_B(double ml) {
-  if (ml <= 0.0) return;
+static bool dose_nutrient_B(double ml) {
+  if (ml <= 0.0) return false;
+
   String cmd = "D," + String(ml, 2);
-  send_command(NUTRIENT_B_PUMP_ADDRESS, cmd.c_str());
-  Serial.print(F("Dose B (mL): ")); Serial.println(ml, 2);
-  strcpy(last_action, "B"); last_action_ml = ml;
+  if (!send_command(NUTRIENT_B_PUMP_ADDRESS, cmd.c_str())) {
+    Serial.println(F("Dose B command failed; dose NOT counted."));
+    return false;
+  }
+
+  Serial.print(F("Dose B command accepted (mL): ")); Serial.println(ml, 2);
+  strcpy(last_action, "B");
+  last_action_ml = ml;
+  return true;
 }
 
-static void dose_ec_down(double ml) {
-  if (ml <= 0.0) return;
+static bool dose_ec_down(double ml) {
+  if (ml <= 0.0) return false;
+
   String cmd = "D," + String(ml, 2);
-  send_command(EC_DOWN_PUMP_ADDRESS, cmd.c_str());
-  Serial.print(F("EC Down (mL): ")); Serial.println(ml, 2);
-  strcpy(last_action, "ECD"); last_action_ml = ml;
+  if (!send_command(EC_DOWN_PUMP_ADDRESS, cmd.c_str())) {
+    Serial.println(F("EC Down command failed; dose NOT counted."));
+    return false;
+  }
+
+  Serial.print(F("EC Down command accepted (mL): ")); Serial.println(ml, 2);
+  strcpy(last_action, "ECD");
+  last_action_ml = ml;
+  return true;
 }
 
-static void dose_ph_down(double ml) {
-  if (ml <= 0.0) return;
+static bool dose_ph_down(double ml) {
+  if (ml <= 0.0) return false;
+
   String cmd = "D," + String(ml, 2);
-  send_command(PH_DOWN_PUMP_ADDRESS, cmd.c_str());
-  Serial.print(F("pH Down dose (mL): ")); Serial.println(ml, 2);
-  strcpy(last_action, "pHD"); last_action_ml = ml;
+  if (!send_command(PH_DOWN_PUMP_ADDRESS, cmd.c_str())) {
+    Serial.println(F("pH Down command failed; dose NOT counted."));
+    return false;
+  }
+
+  Serial.print(F("pH Down command accepted (mL): ")); Serial.println(ml, 2);
+  strcpy(last_action, "pHD");
+  last_action_ml = ml;
+  return true;
 }
 
 /* ────────────────────────────────────────────────────────────
@@ -532,9 +633,16 @@ static void control_loop() {
   const unsigned long now = millis();
   maybe_reset_hourly_caps();
 
+  // Fail-safe gate: the displayed EC value may be a held last-good value, but
+  // control decisions require a successful EC measurement from THIS sensor cycle.
+  // Because this controller is EC-first, pH dosing is also inhibited while EC is invalid.
+  if (!ec_read_valid) {
+    return;
+  }
+
   const bool ph_ok = !(isnan(ph_control) || ph_control < 0.0 || ph_control > 14.0);
 
-  // Stage 1: EC priority
+  // Stage 1: EC has priority over pH.
   const double ec_err = EC_SETPOINT - ec_value;   // +low→Up, −high→Down
   const bool   ec_in_range   = fabs(ec_err) <= EC_DEADBAND;
   const bool   ec_cycle_busy = pending_B;
@@ -552,9 +660,9 @@ static void control_loop() {
           if (EC_DOWN_DOSE_ML > 0.0 && ec_down_dosed_this_window < EC_DOWN_MAX_ML_PER_HR) {
             const double room = EC_DOWN_MAX_ML_PER_HR - ec_down_dosed_this_window;
             const double dose = min(EC_DOWN_DOSE_ML, room);
-            if (dose > 0.0) {
-              dose_ec_down(dose);
-              last_dose_ms_ec_down = now;
+            if (dose > 0.0 && dose_ec_down(dose)) {
+              // State changes only after an acknowledged pump command.
+              last_dose_ms_ec_down = millis();
               last_ec_direction = -1;
               ec_down_dosed_this_window += dose;
             }
@@ -568,15 +676,17 @@ static void control_loop() {
           const double b_room = max(0.0, EC_B_MAX_ML_PER_HR - ec_b_dosed_this_window);
 
           if (a_part > 0.0 && b_part > 0.0 && a_room >= a_part && b_room >= b_part) {
-            dose_nutrient_A(a_part);
-            ec_a_dosed_this_window += a_part;
+            // B is scheduled ONLY if A's I2C command was acknowledged.
+            if (dose_nutrient_A(a_part)) {
+              ec_a_dosed_this_window += a_part;
 
-            pending_B = true;
-            pending_B_ml = b_part;
-            pending_B_ready_ms = now + EC_AB_STAGGER_MS;
+              pending_B = true;
+              pending_B_ml = b_part;
+              pending_B_ready_ms = millis() + EC_AB_STAGGER_MS;
 
-            last_dose_ms_ec_cycle = now;
-            last_ec_direction = +1;
+              last_dose_ms_ec_cycle = millis();
+              last_ec_direction = +1;
+            }
           }
         }
       }
@@ -603,8 +713,8 @@ static void control_loop() {
       if (lockout_ok && cap_ok) {
         const double room = PH_DOWN_MAX_ML_PER_HR - ph_down_dosed_this_window;
         const double dose = min(PH_DOWN_DOSE_ML, room);
-        if (dose > 0.0) {
-          dose_ph_down(dose);
+        if (dose > 0.0 && dose_ph_down(dose)) {
+          // Lockout and hourly accounting begin only after command acknowledgement.
           last_dose_ms_ph_down = millis();
           ph_down_dosed_this_window += dose;
         }
