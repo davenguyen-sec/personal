@@ -86,7 +86,7 @@ static const double PH_SETPOINT = 5.8;       // Target pH
 static const double EC_SETPOINT = 1600.0;    // Target EC in µS/cm (displayed as integer)
 
 // Deadbands around set-points to prevent chatter
-static const double PH_DEADBAND = 0.15;
+static const double PH_DEADBAND = 0.4;
 static const double EC_DEADBAND = 50.0;      // µS/cm
 
 // EC temperature compensation coefficient (fraction/°C relative to 25 °C)
@@ -106,7 +106,7 @@ static const unsigned long EC_B_RETRY_MS      = 5000UL;   // Delay before retryi
 static const double EC_DOWN_DOSE_ML = 0.0;
 
 // pH Down per-dose
-static const double PH_DOWN_DOSE_ML = 1.0;
+static const double PH_DOWN_DOSE_ML = 4.0; // diluted 30mL of 850g/L H2PO4 to make up 500mL => 48%w/v. 1mL dispensation adds 7.6mg/L P
 
 // Mix/settle lockouts to avoid dosing into an unmixed reservoir
 static const unsigned long EC_UP_MIX_LOCKOUT_MS   = 600000UL; // 10 min after any EC Up action
@@ -117,7 +117,7 @@ static const unsigned long PH_DOWN_MIX_LOCKOUT_MS = 1800000UL; // 30 min after a
 static const double  EC_A_MAX_ML_PER_HR    = 40.0;
 static const double  EC_B_MAX_ML_PER_HR    = 40.0;
 static const double  EC_DOWN_MAX_ML_PER_HR = 100.0; // Only meaningful if EC_DOWN_DOSE_ML > 0
-static const double  PH_DOWN_MAX_ML_PER_HR = 2.0;
+static const double  PH_DOWN_MAX_ML_PER_HR = 12.0;
 
 // Sensor cadence: how often a full read/control cycle runs
 static const unsigned long SENSOR_INTERVAL = 10000UL; // 10 s is conservative for hobby reservoirs
