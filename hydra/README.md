@@ -1,4 +1,4 @@
-# Hydra Hydroponics Controller
+# Hydroponics Controller
 
 > Automated hydroponics control using an **Arduino Mega** for sensing and dosing, with an **ESP8266 / NodeMCU v2** bridge for MQTT and Home Assistant telemetry.
 
