@@ -16,6 +16,9 @@
  * IMPORTANT SAFETY RULES
  *  - A failed/invalid EC read may still leave the last good EC value on the LCD and
  *    telemetry, but that stale value is NEVER allowed to authorise dosing.
+ *  - EC communication/parsing failures use NAN internally, not 0.0. This preserves
+ *    0 µS/cm as a legitimate fresh reading while preventing a failed transaction
+ *    from being mistaken for "very low EC".
  *  - If the latest EC measurement is invalid, all new dosing is inhibited until a
  *    fresh valid EC measurement is obtained.
  *  - A pump dose is counted only when its I²C command is successfully acknowledged.
@@ -83,7 +86,7 @@ static const double ANALOG_REF_MV = 5000.0;
 
 // Control set-points
 static const double PH_SETPOINT = 5.8;       // Target pH
-static const double EC_SETPOINT = 1600.0;    // Target EC in µS/cm (displayed as integer)
+static const double EC_SETPOINT = 1000.0;    // Target EC in µS/cm (displayed as integer)
 
 // Deadbands around set-points to prevent chatter
 static const double PH_DEADBAND = 0.4;
@@ -106,7 +109,7 @@ static const unsigned long EC_B_RETRY_MS      = 5000UL;   // Delay before retryi
 static const double EC_DOWN_DOSE_ML = 0.0;
 
 // pH Down per-dose
-static const double PH_DOWN_DOSE_ML = 4.0; // diluted 30mL of 850g/L H2PO4 to make up 500mL => 48%w/v. 1mL dispensation adds 7.6mg/L P
+static const double PH_DOWN_DOSE_ML = 4.0;
 
 // Mix/settle lockouts to avoid dosing into an unmixed reservoir
 static const unsigned long EC_UP_MIX_LOCKOUT_MS   = 600000UL; // 10 min after any EC Up action
@@ -135,6 +138,8 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLS, LCD_ROWS);
 
 // Live sensor values. ec_value may hold the last good reading for display, while
 // ec_read_valid tells the control logic whether the MOST RECENT EC cycle succeeded.
+// A displayed value of 0 is therefore not automatically "invalid": a genuine fresh
+// 0 µS/cm reading has ec_read_valid=true, whereas startup/stale 0 has it set false.
 static double ph_raw = 0.0;          // Instantaneous pH from the probe
 static double ph_control = NAN;      // EMA-smoothed pH used for control
 static double ec_value = 0.0;        // Current display/telemetry EC value (uS/cm)
@@ -219,7 +224,7 @@ static double compensate_ec(double ec_measured, double temperature);
 
 static bool   i2c_send_with_retries(uint8_t address, const char* command, uint8_t max_attempts = 3);
 static bool   send_command(uint8_t address, const char *command);
-static float  read_response_ec_numeric(uint8_t address);
+static double read_response_ec_numeric(uint8_t address);
 static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen);
 
 static bool dose_nutrient_A(double ml);
@@ -454,10 +459,15 @@ static double read_ph_sensor() {
 static double read_ec_sensor() {
   const double raw = read_response_ec_numeric(EC_PROBE_ADDRESS);
 
-  if (raw >= 0.0 && raw < 1000000.0) {
+  // A genuine EC value of 0 µS/cm is valid and must be allowed. Invalid I2C
+  // transactions and malformed EZO frames are represented by NAN instead, so
+  // they cannot accidentally masquerade as "very low EC" and trigger dosing.
+  if (isfinite(raw) && raw >= 0.0 && raw < 1000000.0) {
     const double compensated = compensate_ec(raw, water_temperature);
 
-    if (compensated >= 0.0 && compensated < 1000000.0) {
+    if (isfinite(compensated) &&
+        compensated >= 0.0 &&
+        compensated < 1000000.0) {
       ec_last_good = compensated;
       ec_value = compensated;
       ec_read_valid = true;
@@ -465,12 +475,17 @@ static double read_ec_sensor() {
     }
   }
 
-  // Invalid current read: keep the old value for display/telemetry if available,
-  // but mark it unusable for control so stale EC can never trigger a new dose.
+  // Invalid current read: retain the previous good EC value for a stable LCD
+  // and telemetry display, but mark the latest cycle invalid. control_loop()
+  // requires ec_read_valid == true, so stale display data cannot authorise a
+  // new nutrient or pH dose.
   ec_read_valid = false;
+
   if (!isnan(ec_last_good)) {
     ec_value = ec_last_good;
   } else {
+    // Before the first valid EC measurement, display 0. This is only a display
+    // value while ec_read_valid remains false; it cannot trigger dosing.
     ec_value = 0.0;
   }
 
@@ -516,31 +531,71 @@ static bool send_command(uint8_t address, const char *command) {
   return true;
 }
 
-static float read_response_ec_numeric(uint8_t address) {
+static double read_response_ec_numeric(uint8_t address) {
   const uint8_t bytes = Wire.requestFrom(address, (uint8_t)32);
+
+  // A transport failure is not the same thing as a genuine EC reading of 0.
+  // Return NAN for all invalid transactions so the caller can keep 0 µS/cm as
+  // a legitimate measurement while still blocking dosing on communication errors.
   if (bytes == 0) {
-    Serial.print(F("I2C read error from 0x")); Serial.println(address, HEX);
-    return 0.0f;
+    Serial.print(F("I2C read error from 0x"));
+    Serial.println(address, HEX);
+    return NAN;
   }
+
   // Atlas EZO responses are usable for control only when status == 1 (success).
-  // Treat pending/error/no-data responses as an invalid EC cycle. This check is
-  // part of the fail-safe EC-validity gate above; it prevents a non-OK frame from
-  // being mistaken for a fresh EC measurement.
+  // Status values such as pending, no-data, or error must never be converted to
+  // a numeric zero because 0 µS/cm can be a real measurement during startup or
+  // when the reservoir contains very low-conductivity water.
   const uint8_t status = Wire.read();
   if (status != 1) {
     Serial.print(F("EZO-EC response status not OK: "));
     Serial.println(status);
     while (Wire.available()) Wire.read();
-    return 0.0f;
+    return NAN;
   }
 
-  char buf[31]; uint8_t i = 0;
+  char buf[31];
+  uint8_t i = 0;
+
   while (Wire.available() && i < sizeof(buf) - 1) {
     const char c = Wire.read();
-    if (c >= 32 && c <= 126) buf[i++] = c;
+    if (c >= 32 && c <= 126) {
+      buf[i++] = c;
+    }
   }
-  buf[i] = '\0';
-  return atof(buf);
+  buf[i] = ' ';
+
+  // An empty or malformed payload must also remain invalid. strtod() lets us
+  // distinguish a genuine textual "0" from text that cannot be parsed at all.
+  if (i == 0) {
+    Serial.println(F("EZO-EC response payload was empty."));
+    return NAN;
+  }
+
+  char *endptr = nullptr;
+  const double value = strtod(buf, &endptr);
+
+  if (endptr == buf || !isfinite(value)) {
+    Serial.print(F("EZO-EC response was not numeric: "));
+    Serial.println(buf);
+    return NAN;
+  }
+
+  // Atlas EZO-EC can be configured to return extra comma-separated fields.
+  // The controller uses the first numeric field (EC), so a comma after it is
+  // acceptable. Any other trailing non-whitespace text is treated as malformed.
+  while (*endptr == ' ' || *endptr == '	') {
+    ++endptr;
+  }
+
+  if (*endptr != ' ' && *endptr != ',') {
+    Serial.print(F("EZO-EC response had unexpected trailing data: "));
+    Serial.println(buf);
+    return NAN;
+  }
+
+  return value;
 }
 
 static size_t read_response_ascii(uint8_t address, char *buf, size_t buflen) {
