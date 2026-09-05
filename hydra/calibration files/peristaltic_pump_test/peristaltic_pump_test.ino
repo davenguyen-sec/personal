@@ -1,238 +1,1093 @@
 /* ============================================================
-   Peristaltic Pump Tester (I2C, manual control via Serial)
-   - Test each pump individually by volume (mL) or time (ms)
-   - Quick "prime" and "stop" commands
-   - Matches your previous controller addresses/roles
+   HYDROPONICS PERISTALTIC PUMP TESTER
+   ============================================================
+
+   Purpose
+   -------
+   Manually test and identify each peristaltic pump over I2C
+   before running the full automatic hydroponics controller.
+
+   IMPORTANT:
+   This address mapping MATCHES hydra_main_fixed.ino:
+
+       0x32 = pH Down
+       0x33 = Nutrient A
+       0x34 = Nutrient B
+       0x35 = EC Down / Water
+
+   There is NO pH-Up pump in the main controller.
+
+   Recommended first test
+   ----------------------
+   Put ALL pump inlet tubes into plain water.
+   Put each outlet tube into a separate container.
+
+   Then test ONE pump at a time from Serial Monitor:
+
+       dose phdn 2
+       dose nuta 2
+       dose nutb 2
+       dose ecdn 2
+
+   Label each physical pump after confirming which one runs.
+
+   Serial Monitor:
+       Baud:       9600
+       Line ending: Newline
+
    ============================================================ */
 
-// ---------- Includes ----------
+
 #include <Arduino.h>
 #include <Wire.h>
 
-// ---------- I2C addresses (CHANGE IF YOUR HARDWARE DIFFERS) ----------
-#define PH_DOWN_ADDR  0x32   // Pump 1: pH Down
-#define PH_UP_ADDR    0x33   // Pump 2: pH Up
-#define EC_UP_ADDR    0x34   // Pump 3: Nutrients (EC up)
-#define EC_DOWN_ADDR  0x35   // Pump 4: Water (EC down)
 
-// ---------- SAFETY/TUNABLES (YOU CAN CHANGE THESE) ----------
-static const float  MAX_TEST_ML   = 50.0;      // MAX single dose when using "dose" (mL)
-static const unsigned long MAX_TEST_MS = 60000UL; // MAX single run when using "time"/"prime" (ms)
-static const unsigned long SERIAL_BAUD = 9600;    // Serial speed for the monitor
+/* ============================================================
+   I2C PUMP ADDRESSES
 
-// ---------- HELP TEXT ----------
-const char *HELP_TEXT =
-  "\nPump Tester — commands (type then press Enter):\n"
-  "  help\n"
-  "  list                         # show pump names and I2C addresses\n"
-  "  dose <pump> <mL>             # e.g. dose ecup 5.0\n"
-  "  time <pump> <ms>             # e.g. time ecdn 2500   (run by time)\n"
-  "  prime <pump> <ms>            # alias of 'time', intended for priming lines\n"
-  "  stop <pump|all>              # sends STOP to one or all pumps\n"
-  "  testall                      # runs a short test on all pumps in sequence\n"
-  "\nPumps (case-insensitive): phup, phdn, ecup, ecdn\n";
+   These MUST remain consistent with the main controller.
+   ============================================================ */
 
-// ---------- Simple map from text token -> address ----------
+#define PH_DOWN_ADDR     0x32   // pH Down solution
+#define NUTRIENT_A_ADDR  0x33   // Nutrient Part A
+#define NUTRIENT_B_ADDR  0x34   // Nutrient Part B
+#define EC_DOWN_ADDR     0x35   // Plain water / EC dilution
+
+
+/* ============================================================
+   TEST SAFETY LIMITS
+   ============================================================ */
+
+// Maximum volume allowed in a single "dose" command.
+static const float MAX_TEST_ML = 50.0f;
+
+// Maximum runtime allowed with "time" or "prime".
+static const unsigned long MAX_TEST_MS = 60000UL;
+
+// Serial Monitor baud rate.
+static const unsigned long SERIAL_BAUD = 9600;
+
+
+/* ============================================================
+   PUMP DESCRIPTION TABLE
+   ============================================================
+
+   Commands use these short names:
+
+       phdn = pH Down
+       nuta = Nutrient A
+       nutb = Nutrient B
+       ecdn = EC Down / water
+   ============================================================ */
+
 struct PumpDesc {
   const char *name;
-  uint8_t addr;
+  const char *description;
+  uint8_t address;
 };
+
 
 PumpDesc PUMPS[] = {
-  {"phdn", PH_DOWN_ADDR},   // pH Down
-  {"phup", PH_UP_ADDR},     // pH Up
-  {"ecup", EC_UP_ADDR},     // EC Up (nutrients)
-  {"ecdn", EC_DOWN_ADDR}    // EC Down (water)
+
+  {
+    "phdn",
+    "pH Down",
+    PH_DOWN_ADDR
+  },
+
+  {
+    "nuta",
+    "Nutrient A",
+    NUTRIENT_A_ADDR
+  },
+
+  {
+    "nutb",
+    "Nutrient B",
+    NUTRIENT_B_ADDR
+  },
+
+  {
+    "ecdn",
+    "EC Down / Water",
+    EC_DOWN_ADDR
+  }
 };
 
-static const size_t NUM_PUMPS = sizeof(PUMPS)/sizeof(PUMPS[0]);
 
-// ---------- I2C helpers ----------
-void i2cSend(const uint8_t addr, const char *cmd) {
-  Wire.beginTransmission(addr);
-  while (*cmd) Wire.write(*cmd++);
-  uint8_t err = Wire.endTransmission();
-  if (err != 0) {
-    Serial.print("I2C error to 0x"); Serial.print(addr, HEX);
-    Serial.print(" (code "); Serial.print(err); Serial.println(").");
+static const size_t NUM_PUMPS =
+  sizeof(PUMPS) / sizeof(PUMPS[0]);
+
+
+/* ============================================================
+   HELP TEXT
+   ============================================================ */
+
+const char *HELP_TEXT =
+
+  "\n"
+  "====================================================\n"
+  " Hydroponics Peristaltic Pump Tester\n"
+  "====================================================\n"
+  "\n"
+  "Commands:\n"
+  "\n"
+  "  help\n"
+  "      Show this help screen.\n"
+  "\n"
+  "  list\n"
+  "      Show pump names, roles and I2C addresses.\n"
+  "\n"
+  "  dose <pump> <mL>\n"
+  "      Command a calibrated volume.\n"
+  "      Example: dose nuta 2\n"
+  "\n"
+  "  time <pump> <ms>\n"
+  "      Run a pump by time, if supported by its firmware.\n"
+  "      Example: time nuta 2000\n"
+  "\n"
+  "  prime <pump> <ms>\n"
+  "      Same as 'time'. Intended for priming tubing.\n"
+  "      Example: prime phdn 3000\n"
+  "\n"
+  "  stop <pump>\n"
+  "      Send STOP to one pump, if supported.\n"
+  "      Example: stop nutb\n"
+  "\n"
+  "  stop all\n"
+  "      Send STOP to all four pumps.\n"
+  "\n"
+  "  testall\n"
+  "      Dose 1 mL from each pump sequentially.\n"
+  "      USE WITH PLAIN WATER ONLY while identifying pumps.\n"
+  "\n"
+  "Pump names:\n"
+  "\n"
+  "  phdn = pH Down          @ 0x32\n"
+  "  nuta = Nutrient A       @ 0x33\n"
+  "  nutb = Nutrient B       @ 0x34\n"
+  "  ecdn = EC Down / Water  @ 0x35\n"
+  "\n"
+  "Recommended identification sequence:\n"
+  "\n"
+  "  dose phdn 2\n"
+  "  dose nuta 2\n"
+  "  dose nutb 2\n"
+  "  dose ecdn 2\n"
+  "\n";
+
+
+/* ============================================================
+   I2C COMMUNICATION
+   ============================================================ */
+
+/*
+   Send one ASCII command to a pump controller.
+
+   Returns:
+       true  = I2C transmission was acknowledged
+       false = I2C transmission failed
+
+   Important:
+   An I2C acknowledgement tells us the slave received the
+   transmission. It does NOT prove that liquid physically moved.
+*/
+bool i2cSend(uint8_t address, const char *command) {
+
+  Wire.beginTransmission(address);
+
+  while (*command) {
+    Wire.write(*command++);
   }
+
+  const uint8_t error = Wire.endTransmission();
+
+  if (error != 0) {
+
+    Serial.print(F("ERROR: I2C transmission failed to 0x"));
+    Serial.print(address, HEX);
+
+    Serial.print(F(" | error code "));
+    Serial.println(error);
+
+    return false;
+  }
+
   delay(10);
+
+  return true;
 }
 
-void pumpDose_mL(const uint8_t addr, float mL) {
-  if (mL <= 0.0f) { Serial.println("Dose volume must be > 0 mL."); return; }
+
+/* ============================================================
+   PUMP COMMANDS
+   ============================================================ */
+
+
+/*
+   Dose a calibrated volume.
+
+   This uses the SAME command format as the main hydroponics
+   controller:
+
+       D,<millilitres>
+
+   Example:
+
+       D,2.00
+*/
+bool pumpDose_mL(uint8_t address, float mL) {
+
+  if (mL <= 0.0f) {
+
+    Serial.println(
+      F("ERROR: Dose volume must be greater than 0 mL.")
+    );
+
+    return false;
+  }
+
+
   if (mL > MAX_TEST_ML) {
-    Serial.print("Clamping to MAX_TEST_ML="); Serial.print(MAX_TEST_ML); Serial.println(" mL.");
+
+    Serial.print(F("Requested dose exceeds safety limit. "));
+    Serial.print(F("Clamping to "));
+    Serial.print(MAX_TEST_ML, 1);
+    Serial.println(F(" mL."));
+
     mL = MAX_TEST_ML;
   }
-  String cmd = "D," + String(mL, 2);
-  i2cSend(addr, cmd.c_str());
+
+
+  String command =
+    "D," + String(mL, 2);
+
+
+  return i2cSend(
+    address,
+    command.c_str()
+  );
 }
 
-void pumpRun_timeMs(const uint8_t addr, unsigned long ms) {
-  if (ms == 0) { Serial.println("Time must be > 0 ms."); return; }
+
+/*
+   Run a pump for a specified number of milliseconds.
+
+   Command:
+
+       T,<milliseconds>
+
+   NOTE:
+   The main automatic controller does NOT use this command.
+
+   Only use this function if your individual pump-controller
+   firmware supports the T command.
+*/
+bool pumpRun_timeMs(
+  uint8_t address,
+  unsigned long ms
+) {
+
+  if (ms == 0) {
+
+    Serial.println(
+      F("ERROR: Runtime must be greater than 0 ms.")
+    );
+
+    return false;
+  }
+
+
   if (ms > MAX_TEST_MS) {
-    Serial.print("Clamping to MAX_TEST_MS="); Serial.print(MAX_TEST_MS); Serial.println(" ms.");
+
+    Serial.print(F("Requested runtime exceeds safety limit. "));
+    Serial.print(F("Clamping to "));
+    Serial.print(MAX_TEST_MS);
+    Serial.println(F(" ms."));
+
     ms = MAX_TEST_MS;
   }
-  String cmd = "T," + String(ms);
-  i2cSend(addr, cmd.c_str());
+
+
+  String command =
+    "T," + String(ms);
+
+
+  return i2cSend(
+    address,
+    command.c_str()
+  );
 }
 
-void pumpStop(const uint8_t addr) {
-  // Common firmwares accept a stop command like 'X' — adjust if your modules differ
-  i2cSend(addr, "X");
+
+/*
+   Send a stop command.
+
+   NOTE:
+   This requires the pump-controller firmware to support "X".
+
+   The automatic hydroponics controller does not rely on this
+   command for normal calibrated dosing.
+*/
+bool pumpStop(uint8_t address) {
+
+  return i2cSend(
+    address,
+    "X"
+  );
 }
 
-// ---------- Utility: find address by token ----------
-bool lookupPumpAddr(const String &token, uint8_t &addrOut, const char* &stdNameOut) {
-  String t = token; t.trim(); t.toLowerCase();
+
+/* ============================================================
+   PUMP LOOKUP
+   ============================================================ */
+
+/*
+   Convert a command name such as:
+
+       nuta
+
+   into its corresponding I2C address and description.
+*/
+bool lookupPump(
+  const String &token,
+  uint8_t &addressOut,
+  const char* &nameOut,
+  const char* &descriptionOut
+) {
+
+  String search = token;
+
+  search.trim();
+  search.toLowerCase();
+
+
   for (size_t i = 0; i < NUM_PUMPS; ++i) {
-    String n = PUMPS[i].name;
-    if (t == n) {
-      addrOut = PUMPS[i].addr;
-      stdNameOut = PUMPS[i].name;
+
+    if (search.equals(PUMPS[i].name)) {
+
+      addressOut = PUMPS[i].address;
+
+      nameOut =
+        PUMPS[i].name;
+
+      descriptionOut =
+        PUMPS[i].description;
+
       return true;
     }
   }
+
+
   return false;
 }
 
+
+/* ============================================================
+   DISPLAY PUMP LIST
+   ============================================================ */
+
 void printList() {
-  Serial.println("\nPumps:");
+
+  Serial.println();
+  Serial.println(F("Configured pumps:"));
+  Serial.println();
+
+
   for (size_t i = 0; i < NUM_PUMPS; ++i) {
-    Serial.print("  ");
-    Serial.print(PUMPS[i].name);
-    Serial.print(" @ 0x");
-    Serial.println(PUMPS[i].addr, HEX);
+
+    Serial.print(F("  "));
+
+    Serial.print(
+      PUMPS[i].name
+    );
+
+    Serial.print(F("  |  "));
+
+    Serial.print(
+      PUMPS[i].description
+    );
+
+    Serial.print(F("  |  I2C 0x"));
+
+    Serial.println(
+      PUMPS[i].address,
+      HEX
+    );
   }
+
+
   Serial.println();
 }
 
+
+/* ============================================================
+   TEST ALL PUMPS
+   ============================================================ */
+
+/*
+   Runs a very small calibrated dose through each pump.
+
+   IMPORTANT:
+   Use plain water when using this while identifying pumps.
+
+   Individual testing is still preferred.
+*/
 void quickTestAll() {
-  Serial.println("Quick test: dosing each pump briefly...");
-  // Adjust these defaults if you prefer time or volume
-  const float test_mL = 2.0;             // small, visible dose
-  const unsigned long settle_ms = 500;   // short gap between pumps
+
+  const float TEST_ML = 1.0f;
+
+  const unsigned long GAP_MS =
+    1000UL;
+
+
+  Serial.println();
+
+  Serial.println(
+    F("WARNING: testall will activate ALL FOUR pumps.")
+  );
+
+  Serial.println(
+    F("Use this with plain water while identifying pumps.")
+  );
+
+  Serial.println();
+
 
   for (size_t i = 0; i < NUM_PUMPS; ++i) {
-    Serial.print("  -> "); Serial.print(PUMPS[i].name);
-    Serial.print(" dose "); Serial.print(test_mL, 1); Serial.println(" mL");
-    pumpDose_mL(PUMPS[i].addr, test_mL);
-    delay(settle_ms);
+
+    Serial.print(F("Testing "));
+
+    Serial.print(
+      PUMPS[i].name
+    );
+
+    Serial.print(F(" ("));
+
+    Serial.print(
+      PUMPS[i].description
+    );
+
+    Serial.print(F(") @ 0x"));
+
+    Serial.print(
+      PUMPS[i].address,
+      HEX
+    );
+
+    Serial.print(F(" -> "));
+
+    Serial.print(
+      TEST_ML,
+      1
+    );
+
+    Serial.println(F(" mL"));
+
+
+    const bool ok =
+      pumpDose_mL(
+        PUMPS[i].address,
+        TEST_ML
+      );
+
+
+    if (ok) {
+
+      Serial.println(
+        F("  I2C command accepted.")
+      );
+
+    } else {
+
+      Serial.println(
+        F("  FAILED - command not acknowledged.")
+      );
+    }
+
+
+    delay(GAP_MS);
   }
-  Serial.println("Quick test complete.");
+
+
+  Serial.println();
+
+  Serial.println(
+    F("testall complete.")
+  );
+
+  Serial.println();
 }
 
-// ---------- Command parsing ----------
-void printHelp() { Serial.print(HELP_TEXT); }
+
+/* ============================================================
+   HELP
+   ============================================================ */
+
+void printHelp() {
+
+  Serial.print(
+    HELP_TEXT
+  );
+}
+
+
+/* ============================================================
+   COMMAND PARSER
+   ============================================================ */
 
 void parseLine(String line) {
-  line.trim();
-  if (line.length() == 0) return;
 
-  // Tokenise (space-separated)
-  String cmd, arg1, arg2;
-  int sp1 = line.indexOf(' ');
-  if (sp1 < 0) {
-    cmd = line;
+  line.trim();
+
+
+  if (line.length() == 0) {
+    return;
+  }
+
+
+  /* ----------------------------------------------------------
+     Split the command into:
+
+         command argument1 argument2
+
+     Example:
+
+         dose nuta 2.5
+  ---------------------------------------------------------- */
+
+  String command;
+  String arg1;
+  String arg2;
+
+
+  const int firstSpace =
+    line.indexOf(' ');
+
+
+  if (firstSpace < 0) {
+
+    command = line;
+
   } else {
-    cmd = line.substring(0, sp1);
-    String rest = line.substring(sp1 + 1);
-    rest.trim();
-    int sp2 = rest.indexOf(' ');
-    if (sp2 < 0) {
-      arg1 = rest;
+
+    command =
+      line.substring(
+        0,
+        firstSpace
+      );
+
+
+    String remainder =
+      line.substring(
+        firstSpace + 1
+      );
+
+
+    remainder.trim();
+
+
+    const int secondSpace =
+      remainder.indexOf(' ');
+
+
+    if (secondSpace < 0) {
+
+      arg1 = remainder;
+
     } else {
-      arg1 = rest.substring(0, sp2);
-      arg2 = rest.substring(sp2 + 1);
+
+      arg1 =
+        remainder.substring(
+          0,
+          secondSpace
+        );
+
+
+      arg2 =
+        remainder.substring(
+          secondSpace + 1
+        );
+
+
       arg2.trim();
     }
   }
 
-  cmd.toLowerCase();
 
-  if (cmd == "help") { printHelp(); return; }
-  if (cmd == "list") { printList(); return; }
-  if (cmd == "testall") { quickTestAll(); return; }
+  command.toLowerCase();
 
-  if (cmd == "stop") {
-    if (arg1.length() == 0 || arg1.equalsIgnoreCase("all")) {
-      for (size_t i = 0; i < NUM_PUMPS; ++i) pumpStop(PUMPS[i].addr);
-      Serial.println("Sent STOP to all pumps.");
-      return;
-    } else {
-      uint8_t addr; const char* name;
-      if (!lookupPumpAddr(arg1, addr, name)) {
-        Serial.println("Unknown pump. Use: phup, phdn, ecup, ecdn");
-        return;
+
+  /* ----------------------------------------------------------
+     HELP
+  ---------------------------------------------------------- */
+
+  if (command == "help") {
+
+    printHelp();
+
+    return;
+  }
+
+
+  /* ----------------------------------------------------------
+     LIST
+  ---------------------------------------------------------- */
+
+  if (command == "list") {
+
+    printList();
+
+    return;
+  }
+
+
+  /* ----------------------------------------------------------
+     TEST ALL
+  ---------------------------------------------------------- */
+
+  if (command == "testall") {
+
+    quickTestAll();
+
+    return;
+  }
+
+
+  /* ----------------------------------------------------------
+     STOP
+  ---------------------------------------------------------- */
+
+  if (command == "stop") {
+
+    if (
+      arg1.length() == 0 ||
+      arg1.equalsIgnoreCase("all")
+    ) {
+
+      Serial.println(
+        F("Sending STOP to all pumps...")
+      );
+
+
+      for (
+        size_t i = 0;
+        i < NUM_PUMPS;
+        ++i
+      ) {
+
+        const bool ok =
+          pumpStop(
+            PUMPS[i].address
+          );
+
+
+        Serial.print(F("  "));
+
+        Serial.print(
+          PUMPS[i].name
+        );
+
+        Serial.print(F(": "));
+
+
+        if (ok) {
+
+          Serial.println(
+            F("command accepted")
+          );
+
+        } else {
+
+          Serial.println(
+            F("I2C FAILED")
+          );
+        }
       }
-      pumpStop(addr);
-      Serial.print("Sent STOP to "); Serial.println(name);
-      return;
-    }
-  }
 
-  if (cmd == "dose") {
-    if (arg1.length() == 0 || arg2.length() == 0) {
-      Serial.println("Usage: dose <pump> <mL>   e.g. dose ecup 5.0");
+
       return;
     }
-    uint8_t addr; const char* name;
-    if (!lookupPumpAddr(arg1, addr, name)) {
-      Serial.println("Unknown pump. Use: phup, phdn, ecup, ecdn");
+
+
+    uint8_t address;
+
+    const char* pumpName;
+    const char* description;
+
+
+    if (
+      !lookupPump(
+        arg1,
+        address,
+        pumpName,
+        description
+      )
+    ) {
+
+      Serial.println(
+        F("Unknown pump.")
+      );
+
+      Serial.println(
+        F("Use: phdn, nuta, nutb, ecdn")
+      );
+
       return;
     }
-    float mL = arg2.toFloat();
-    if (mL <= 0) { Serial.println("Enter a positive mL value."); return; }
-    Serial.print("Dosing "); Serial.print(name);
-    Serial.print(": "); Serial.print(mL, 2); Serial.println(" mL");
-    pumpDose_mL(addr, mL);
+
+
+    const bool ok =
+      pumpStop(address);
+
+
+    if (ok) {
+
+      Serial.print(F("STOP command accepted by "));
+      Serial.println(description);
+
+    } else {
+
+      Serial.print(F("STOP FAILED for "));
+      Serial.println(description);
+    }
+
+
     return;
   }
 
-  if (cmd == "time" || cmd == "prime") {
-    if (arg1.length() == 0 || arg2.length() == 0) {
-      Serial.println(String("Usage: ") + cmd + " <pump> <ms>   e.g. " + cmd + " ecdn 2500");
+
+  /* ----------------------------------------------------------
+     DOSE
+  ---------------------------------------------------------- */
+
+  if (command == "dose") {
+
+    if (
+      arg1.length() == 0 ||
+      arg2.length() == 0
+    ) {
+
+      Serial.println(
+        F("Usage: dose <pump> <mL>")
+      );
+
+      Serial.println(
+        F("Example: dose nuta 2")
+      );
+
       return;
     }
-    uint8_t addr; const char* name;
-    if (!lookupPumpAddr(arg1, addr, name)) {
-      Serial.println("Unknown pump. Use: phup, phdn, ecup, ecdn");
+
+
+    uint8_t address;
+
+    const char* pumpName;
+    const char* description;
+
+
+    if (
+      !lookupPump(
+        arg1,
+        address,
+        pumpName,
+        description
+      )
+    ) {
+
+      Serial.println(
+        F("Unknown pump.")
+      );
+
+      Serial.println(
+        F("Use: phdn, nuta, nutb, ecdn")
+      );
+
       return;
     }
-    unsigned long ms = (unsigned long)arg2.toInt();
-    if (ms == 0) { Serial.println("Enter a positive time in ms."); return; }
-    Serial.print("Running "); Serial.print(name);
-    Serial.print(" for "); Serial.print(ms); Serial.println(" ms");
-    pumpRun_timeMs(addr, ms);
+
+
+    const float mL =
+      arg2.toFloat();
+
+
+    if (mL <= 0.0f) {
+
+      Serial.println(
+        F("Enter a positive mL value.")
+      );
+
+      return;
+    }
+
+
+    Serial.print(F("Commanding "));
+
+    Serial.print(description);
+
+    Serial.print(F(" @ 0x"));
+
+    Serial.print(address, HEX);
+
+    Serial.print(F(": "));
+
+    Serial.print(mL, 2);
+
+    Serial.println(F(" mL"));
+
+
+    const bool ok =
+      pumpDose_mL(
+        address,
+        mL
+      );
+
+
+    if (ok) {
+
+      Serial.println(
+        F("I2C command accepted.")
+      );
+
+    } else {
+
+      Serial.println(
+        F("FAILED: pump did not acknowledge I2C command.")
+      );
+    }
+
+
     return;
   }
 
-  Serial.println("Unknown command. Type 'help' for usage.");
+
+  /* ----------------------------------------------------------
+     TIME / PRIME
+  ---------------------------------------------------------- */
+
+  if (
+    command == "time" ||
+    command == "prime"
+  ) {
+
+    if (
+      arg1.length() == 0 ||
+      arg2.length() == 0
+    ) {
+
+      Serial.print(F("Usage: "));
+
+      Serial.print(command);
+
+      Serial.println(
+        F(" <pump> <ms>")
+      );
+
+      Serial.print(F("Example: "));
+
+      Serial.print(command);
+
+      Serial.println(
+        F(" nuta 2500")
+      );
+
+      return;
+    }
+
+
+    uint8_t address;
+
+    const char* pumpName;
+    const char* description;
+
+
+    if (
+      !lookupPump(
+        arg1,
+        address,
+        pumpName,
+        description
+      )
+    ) {
+
+      Serial.println(
+        F("Unknown pump.")
+      );
+
+      Serial.println(
+        F("Use: phdn, nuta, nutb, ecdn")
+      );
+
+      return;
+    }
+
+
+    const long enteredTime =
+      arg2.toInt();
+
+
+    if (enteredTime <= 0) {
+
+      Serial.println(
+        F("Enter a positive time in milliseconds.")
+      );
+
+      return;
+    }
+
+
+    const unsigned long ms =
+      (unsigned long)enteredTime;
+
+
+    Serial.print(F("Commanding "));
+
+    Serial.print(description);
+
+    Serial.print(F(" for "));
+
+    Serial.print(ms);
+
+    Serial.println(F(" ms"));
+
+
+    const bool ok =
+      pumpRun_timeMs(
+        address,
+        ms
+      );
+
+
+    if (ok) {
+
+      Serial.println(
+        F("I2C command accepted.")
+      );
+
+    } else {
+
+      Serial.println(
+        F("FAILED: pump did not acknowledge I2C command.")
+      );
+    }
+
+
+    return;
+  }
+
+
+  /* ----------------------------------------------------------
+     UNKNOWN COMMAND
+  ---------------------------------------------------------- */
+
+  Serial.println(
+    F("Unknown command. Type 'help' for usage.")
+  );
 }
 
-// ---------- Arduino setup/loop ----------
+
+/* ============================================================
+   ARDUINO SETUP
+   ============================================================ */
+
 void setup() {
-  Serial.begin(SERIAL_BAUD);
+
+  Serial.begin(
+    SERIAL_BAUD
+  );
+
+
   Wire.begin();
+
+
   delay(100);
-  Serial.println("\nPeristaltic Pump Tester ready.");
+
+
+  Serial.println();
+  Serial.println(
+    F("====================================================")
+  );
+
+  Serial.println(
+    F(" Hydroponics Peristaltic Pump Tester READY")
+  );
+
+  Serial.println(
+    F("====================================================")
+  );
+
+
+  Serial.println();
+
+  Serial.println(
+    F("IMPORTANT: For initial identification, use WATER")
+  );
+
+  Serial.println(
+    F("in all four pump inlet tubes.")
+  );
+
+
   printHelp();
+
   printList();
 }
 
+
+/* ============================================================
+   ARDUINO MAIN LOOP
+   ============================================================ */
+
 void loop() {
-  // Read a whole line from Serial (blocking only while characters arrive)
+
+  /*
+     Collect one complete command from Serial Monitor.
+
+     Commands are processed when a newline character arrives.
+  */
+
   static String buffer;
+
+
   while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;         // ignore CR
+
+    const char c =
+      (char)Serial.read();
+
+
+    // Ignore carriage return.
+    if (c == '\r') {
+      continue;
+    }
+
+
+    // End of command.
     if (c == '\n') {
+
       parseLine(buffer);
+
       buffer = "";
-    } else {
+
+      continue;
+    }
+
+
+    /*
+       Prevent an accidentally enormous Serial command from
+       consuming excessive RAM.
+    */
+
+    if (buffer.length() < 100) {
+
       buffer += c;
+
+    } else {
+
+      buffer = "";
+
+      Serial.println(
+        F("ERROR: Serial command too long; buffer cleared.")
+      );
     }
   }
 }
