@@ -436,42 +436,163 @@ All dose totals are **commanded/acknowledged volume**, not measured physical flo
 
 ---
 
-## Critical EC Validity Issue
+## EC Validity and Fail-Safe Behaviour
 
-> [!WARNING]
-> The current Mega implementation does not completely match its own fail-safe comments.
+The EC handling has been updated so that a **genuine `0 µS/cm` reading remains valid**, while communication or parsing failures are treated as invalid.
 
-`read_response_ec_numeric()` returns `0.0` when:
-- `Wire.requestFrom()` returns no bytes
-- Atlas response status is not `1`
-- parsing fails into a zero-like numeric result
+### Why this matters
 
-Then `read_ec_sensor()` accepts:
+A real EC value of zero can legitimately occur:
+- at startup
+- with very low-conductivity water
+- before nutrients have been added
 
-```cpp
-raw >= 0.0 && raw < 1000000.0
-```
-
-Therefore an error-generated `0.0` can be treated as:
+Therefore the controller must not use:
 
 ```text
-EC = 0
+EC > 0
+```
+
+as a validity test.
+
+Instead, it separates:
+
+```text
+ec_value
+```
+
+from:
+
+```text
+ec_read_valid
+```
+
+### Current behaviour
+
+A fresh, valid EZO response containing:
+
+```text
+0
+```
+
+produces:
+
+```text
+ec_value      = 0
 ec_read_valid = true
 ```
 
-This means a failed EC read could be interpreted as very low EC and potentially authorise an EC-up nutrient dose once other timing conditions allow.
+This means the controller can correctly recognise that EC is far below the `1000 µS/cm` setpoint and begin EC-up dosing once the normal timing and cap conditions allow it.
 
-### Recommended fix
+By contrast, an invalid transaction now returns:
 
-Use an invalid sentinel such as:
-
-```cpp
+```text
 NAN
 ```
 
-for failed EC reads, and explicitly reject non-finite values in `read_ec_sensor()`.
+rather than `0.0`.
 
-This should be corrected before relying on unattended fail-safe EC dosing.
+Examples include:
+- no bytes returned by `Wire.requestFrom()`
+- EZO response status other than `1`
+- empty response payload
+- malformed/non-numeric payload
+- non-finite parsed value
+
+Those cases result in:
+
+```text
+ec_read_valid = false
+```
+
+and the controller inhibits all new dosing for that sensor cycle.
+
+### Startup behaviour
+
+At startup:
+
+```text
+ec_value      = 0
+ec_read_valid = false
+```
+
+The displayed value may therefore be zero before the first valid EC measurement, but this startup zero cannot authorise dosing because the validity flag is false.
+
+After the first successful EC read:
+
+```text
+ec_read_valid = true
+```
+
+and the returned EC value becomes eligible for control decisions.
+
+### Stale EC display behaviour
+
+If a later EC read fails after at least one successful reading:
+
+```text
+ec_value
+```
+
+retains the last good EC value for LCD and telemetry continuity.
+
+However:
+
+```text
+ec_read_valid = false
+```
+
+so that stale EC value cannot authorise:
+- EC-up
+- EC-down
+- pH-down
+
+because EC validity gates the entire control loop.
+
+### Practical result
+
+The controller now distinguishes these states correctly:
+
+| Situation | `ec_value` | `ec_read_valid` | Dosing allowed? |
+|---|---:|---|---|
+| Startup, no valid EC yet | `0` | `false` | No |
+| Genuine fresh EC = `0` | `0` | `true` | Yes, subject to normal control rules |
+| Valid EC = `980` | `980` | `true` | Yes |
+| Communication/parsing failure after good read | Last good EC | `false` | No |
+
+This preserves automatic nutrient build-up from very low EC while preventing failed EC transactions from masquerading as a low-EC condition.
+
+---
+
+## EC Response Parsing
+
+The EZO numeric response parser now uses `strtod()` rather than relying solely on `atof()`.
+
+This allows the code to distinguish:
+
+```text
+"0"
+```
+
+from malformed or empty text.
+
+The parser accepts:
+- a normal numeric EC value
+- a valid first numeric EC field followed by a comma-separated EZO field
+
+It rejects:
+- empty payloads
+- non-numeric text
+- non-finite values
+- unexpected trailing text
+
+Invalid responses return:
+
+```text
+NAN
+```
+
+and therefore cannot authorise dosing.
 
 ---
 
@@ -1045,7 +1166,8 @@ Check these in order:
 
 10. **Did the pump I²C command fail?**
 
-11. **Has an EC communication failure been interpreted as zero?**
+11. **Is the latest EC cycle invalid?**
+    - invalid EC cycles inhibit new dosing until a fresh valid reading is obtained
 
 ---
 
@@ -1129,7 +1251,7 @@ The system is closed-loop through later pH/EC measurements, but pump delivery it
 - [ ] Verify no siphoning
 - [ ] Verify strong reservoir mixing
 - [ ] Verify commanded volume matches physical dose
-- [ ] Correct or mitigate the EC invalid-read issue
+- [ ] Verify EC communication failures are reported as invalid rather than as numeric zero
 
 ### During operation
 
@@ -1162,6 +1284,8 @@ EC-up lockout            10 min
 A hourly cap             40 mL
 B hourly cap             40 mL
 Automatic EC-down        Disabled
+EC failure sentinel        NAN
+EC validity gate          Required for all new dosing
 
 Sensor cycle             10 s
 LCD page rotation        3 s
@@ -1174,11 +1298,19 @@ MQTT                     TCP 1883
 
 ---
 
-## Most Important Known Issue
+## EC Safety Status
 
-> [!WARNING]
-> A failed EC response can currently become numeric `0.0` and then be accepted as a valid EC reading.  
-> Correct this before treating the EC validity gate as fail-safe.
+> [!NOTE]
+> The previous EC-validity ambiguity has been corrected.
+
+The current implementation:
+- accepts a genuine `0 µS/cm` reading as valid
+- returns `NAN` for EC transport/parsing failures
+- rejects non-finite EC values
+- keeps stale EC values for display only
+- requires `ec_read_valid == true` before any new dosing can occur
+
+This is the intended fail-safe behaviour.
 
 ---
 
