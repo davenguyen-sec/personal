@@ -76,20 +76,20 @@ Atlas EZO-EC ───────────┤                  ├───�
 | Parameter | Value |
 |---|---:|
 | Setpoint | `5.80` |
-| Deadband | `0.15` |
-| Actual pH-down trigger | `ph_control > 5.95` |
-| Dose per action | `1.0 mL` |
+| Deadband | `0.40` |
+| Actual pH-down trigger | `ph_control > 6.20` |
+| Dose per action | `4.0 mL` |
 | Lockout | `30 min` |
-| Hourly cap | `2.0 mL` |
+| Hourly cap | `12.0 mL` |
 | EMA alpha | `0.20` |
 
 ### EC
 
 | Parameter | Value |
 |---|---:|
-| Setpoint | `1600 µS/cm` |
+| Setpoint | `1000 µS/cm` |
 | Deadband | `±50 µS/cm` |
-| Accepted range | `1550–1650 µS/cm` |
+| Accepted range | `950–1050 µS/cm` |
 | Total EC-up dose | `8.0 mL` |
 | A:B ratio | `1:1` |
 | Nutrient A | `4.0 mL` |
@@ -178,7 +178,7 @@ Configured values:
 
 ```text
 PH_SETPOINT = 5.80
-PH_DEADBAND = 0.15
+PH_DEADBAND = 0.40
 ```
 
 The controller has a pH-down pump only.
@@ -186,19 +186,19 @@ The controller has a pH-down pump only.
 The actual trigger is therefore:
 
 ```text
-ph_control > 5.80 + 0.15
-ph_control > 5.95
+ph_control > 5.80 + 0.40
+ph_control > 6.20
 ```
 
-At exactly `5.95`, the controller does **not** dose because the comparison is strict `>` rather than `>=`.
+At exactly `6.20`, the controller does **not** dose because the comparison is strict `>` rather than `>=`.
 
 > [!IMPORTANT]
-> `5.95` is the **upper dosing threshold**, not the configured pH setpoint.
+> `6.20` is the **upper dosing threshold**, not the configured pH setpoint.
 
 There is no pH-up action below:
 
 ```text
-5.80 - 0.15 = 5.65
+5.80 - 0.40 = 5.40
 ```
 
 So this is not a symmetric two-sided pH controller.
@@ -210,25 +210,25 @@ So this is not a symmetric two-sided pH controller.
 A pH-down dose requires **all** of the following:
 
 1. Latest EC cycle is valid
-2. EC is inside `1550–1650 µS/cm`
+2. EC is inside `950–1050 µS/cm`
 3. No Nutrient B dose is pending
 4. Previous EC correction has finished settling
 5. `ph_control` is valid and within `0–14`
-6. `ph_control > 5.95`
+6. `ph_control > 6.20`
 7. 30-minute pH lockout has expired
-8. pH-down hourly total is below `2.0 mL`
+8. pH-down hourly total is below `12.0 mL`
 9. Remaining hourly allowance is positive
 10. The pH-down pump acknowledges the I²C command
 
 A successful action normally commands:
 
 ```text
-1.0 mL pH-down
+4.0 mL pH-down
 ```
 
 Then the controller:
 - starts the 30-minute lockout
-- adds `1.0 mL` to the pH-down hourly total
+- adds `4.0 mL` to the pH-down hourly total
 - updates `LAST = pHD`
 
 ---
@@ -258,7 +258,7 @@ abs(ec_error) <= 50
 Therefore:
 
 ```text
-1550 <= EC <= 1650 µS/cm
+950 <= EC <= 1050 µS/cm
 ```
 
 If EC is outside this range, or Nutrient B is pending, the controller exits before reaching pH control.
@@ -273,7 +273,7 @@ If EC is outside this range, or Nutrient B is pending, the controller exits befo
 When:
 
 ```text
-EC < 1550 µS/cm
+EC < 950 µS/cm
 ```
 
 the controller attempts EC-up.
@@ -363,7 +363,7 @@ Practical consequence:
 When:
 
 ```text
-EC > 1650 µS/cm
+EC > 1050 µS/cm
 ```
 
 the controller enters the EC-down branch.
@@ -558,14 +558,16 @@ A reboot clears these counters because they are stored only in RAM.
 Configured:
 
 ```text
-Dose         = 1.0 mL
+Dose         = 4.0 mL
 Lockout      = 30 min
-Hourly cap   = 2.0 mL
+Hourly cap   = 12.0 mL
 ```
 
 Practical maximum:
 - normally no more than one accepted pH dose every 30 minutes
-- normally no more than 2 mL in one accounting window
+- the software cap allows up to 12 mL in one accounting window
+- because each dose is 4 mL, the cap corresponds to at most three accepted pH-down doses per accounting window
+- the 30-minute lockout usually limits the practical rate before the 12 mL cap does
 
 Actual dosing still depends on EC state, EMA pH, and all other interlocks.
 
@@ -928,11 +930,11 @@ so displayed uptime wraps after roughly **49.7 days**.
 
 ## Practical Examples
 
-### pH = 5.90, EC = 1600
+### pH = 6.00, EC = 1000
 
 ```text
 pH is above setpoint
-but below 5.95 trigger
+but below 6.20 trigger
 ```
 
 Result:
@@ -941,15 +943,15 @@ Result:
 No pH dose
 ```
 
-### pH = 5.96, EC = 1600
+### pH = 6.21, EC = 1000
 
 Assuming all interlocks are satisfied:
 
 ```text
-Command 1.0 mL pH-down
+Command 4.0 mL pH-down
 ```
 
-### EC = 1500
+### EC = 900
 
 ```text
 EC error = +100
@@ -962,7 +964,7 @@ Result:
 then 4 mL B after 2 min
 ```
 
-### EC = 1670
+### EC = 1070
 
 ```text
 EC error = -70
@@ -979,7 +981,7 @@ Therefore:
 - no water dose occurs
 - pH control remains blocked
 
-### EC = 1550
+### EC = 950
 
 ```text
 Error = +50
@@ -991,7 +993,7 @@ Result:
 In range
 ```
 
-### EC = 1650
+### EC = 1050
 
 ```text
 Error = -50
@@ -1003,7 +1005,7 @@ Result:
 In range
 ```
 
-### pH = exactly 5.95
+### pH = exactly 6.20
 
 Result:
 
@@ -1023,21 +1025,21 @@ Check these in order:
    - EC-up waits about `10 min`
    - pH-down waits about `30 min`
 
-2. **Is EC above 1650?**
+2. **Is EC above 1050?**
    - EC-down is disabled
    - pH is blocked
 
-3. **Is EC below 1550 but inside its EC lockout?**
+3. **Is EC below 950 but inside its EC lockout?**
 
 4. **Is Nutrient B pending?**
 
 5. **Is the EC settle period still active?**
 
-6. **Is raw pH high but `PH_C <= 5.95`?**
+6. **Is raw pH high but `PH_C <= 6.20`?**
 
 7. **Is the 30-minute pH lockout active?**
 
-8. **Has the pH hourly cap reached 2 mL?**
+8. **Has the pH hourly cap reached 12 mL?**
 
 9. **Has an EC nutrient cap been reached?**
 
@@ -1132,7 +1134,7 @@ The system is closed-loop through later pH/EC measurements, but pump delivery it
 ### During operation
 
 - [ ] Watch `PH_C`, not only `PH_RAW`
-- [ ] Check EC is within `1550–1650 µS/cm` before expecting pH dosing
+- [ ] Check EC is within `950–1050 µS/cm` before expecting pH dosing
 - [ ] Check A/B/pH hourly totals when diagnosing lockouts
 - [ ] Use `LAST` and `LAST_ML` to see the last acknowledged pump action
 - [ ] Use `hydro/status` to identify stale MQTT data
@@ -1144,14 +1146,14 @@ The system is closed-loop through later pH/EC measurements, but pump delivery it
 
 ```text
 pH setpoint              5.80
-pH-down trigger          > 5.95
-pH dose                  1.0 mL
+pH-down trigger          > 6.20
+pH dose                  4.0 mL
 pH lockout               30 min
-pH hourly cap            2.0 mL
+pH hourly cap            12.0 mL
 pH EMA alpha             0.20
 
-EC setpoint              1600 µS/cm
-EC range                 1550–1650 µS/cm
+EC setpoint              1000 µS/cm
+EC range                 950–1050 µS/cm
 EC-up total              8.0 mL
 Nutrient A               4.0 mL
 Nutrient B               4.0 mL
