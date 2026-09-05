@@ -454,7 +454,7 @@ static double read_ph_sensor() {
 static double read_ec_sensor() {
   const double raw = read_response_ec_numeric(EC_PROBE_ADDRESS);
 
-  if (raw > 0.0 && raw < 1000000.0) {
+  if (raw >= 0.0 && raw < 1000000.0) {
     const double compensated = compensate_ec(raw, water_temperature);
 
     if (compensated > 0.0 && compensated < 1000000.0) {
