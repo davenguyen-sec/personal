@@ -2,88 +2,173 @@
 
 > **Tailored build:** Ender 3 V2 · Creality V4.2.2 · STM32F103RET6 · DWIN display · Sprite Extruder Pro · CR Touch · UBL · T13 · MPC
 
-This README documents the exact process used to build a custom **mriscoc Professional Firmware** image for this specific Ender 3 V2.
+This README documents the **complete Windows workflow** used to create a current custom **mriscoc Professional Firmware** image for this specific Ender 3 V2, including Python installation, Windows setup, the mriscoc Configurator, VS Code, PlatformIO, compilation, SD-card preparation, flashing, and first-start checks.
 
 ---
 
-## 1. Hardware profile
+## 1. Exact hardware profile
 
 | Component | This printer |
 |---|---|
 | Printer | **Creality Ender 3 V2** |
 | Mainboard | **Creality V4.2.2** |
 | MCU | **STM32F103RET6** |
-| Flash size / build target | **512 KB / STM32F103RE** |
+| Build target | **STM32F103RE_creality (512K)** |
 | Display | **DWIN** |
 | Extruder / hot end | **Sprite Extruder Pro** |
 | Probe | **CR Touch** |
-| Bed levelling | **UBL (Unified Bed Levelling)** |
+| Levelling | **BLT + UBL** |
 | Thermistor configuration | **T13 / Marlin #13 (3950)** |
-| Hot-end control | **MPC** |
+| Hot-end thermal control | **MPC** |
 | Input Shaping | Not enabled initially |
 | Linear Advance | Not enabled initially |
 
-### Target configuration name
+### Target firmware configuration
 
 ```text
 Ender3V2-422-BLTUBL-T13-MPC
 ```
 
-This is the configuration to reproduce.
-
 ---
 
-## 2. Important safety note
+# 2. Safety before starting
 
 > [!WARNING]
-> **Do not flash or use this T13 firmware with the original Ender 3 V2 hot end.**
+> **Do not flash or use this T13 firmware while the original Ender 3 V2 hot end is still fitted.**
 >
-> This build is intended for the **Sprite Extruder Pro / compatible all-metal hot end and thermistor arrangement**. Install the Sprite Pro and CR Touch before flashing this firmware.
+> This firmware build is intended for the **Sprite Extruder Pro / compatible all-metal hot-end and thermistor arrangement**.
 
-Also:
+Before working on the printer:
 
-- Disconnect mains power before working inside the electronics enclosure.
-- Double-check heater and thermistor wiring before the first power-on.
-- After flashing, verify temperature behaviour at conservative temperatures before attempting high-temperature printing.
-- Do not immediately command 300 °C simply because the firmware permits it.
+- Turn the printer off.
+- Unplug mains power.
+- Do not disconnect or reconnect motherboard wiring while powered.
+- Verify heater and thermistor wiring before first power-up.
+- Do not immediately command 300 °C after installation.
+- Verify temperature behaviour progressively at normal temperatures first.
 
 ---
 
-## 3. Software required
+# 3. Windows software required
 
-Install:
+You will install:
 
-- **Python 3**
-- **Visual Studio Code**
-- VS Code extension: **PlatformIO IDE**
-- VS Code extension: **Auto Build Marlin**
+1. **Python 3**
+2. **Visual Studio Code**
+3. VS Code extension: **PlatformIO IDE**
+4. VS Code extension: **Auto Build Marlin**
 
-Repositories:
+You will also download:
 
-- mriscoc Professional Firmware  
+- **mriscoc Professional Firmware source**  
   `https://github.com/mriscoc/Ender3V2S1`
 
-- mriscoc Special Configurations  
+- **mriscoc Special Configurations**  
   `https://github.com/mriscoc/Special_Configurations`
-
-> [!TIP]
-> Keep the extracted firmware source in a short Windows path, for example:
->
-> ```text
-> C:\mriscoc\
-> ```
->
-> This helps avoid Windows path-length problems during compilation.
 
 ---
 
-## 4. Generate the custom configuration
+# 4. Install Python on Windows
 
-Download the **main branch/repository ZIP** of `Special_Configurations`.
+Download Python 3 for Windows from:
 
-Do **not** use the old release-page source-code placeholder ZIP.
+```text
+https://www.python.org/downloads/windows/
+```
 
-Extract the whole repository. It should contain files/folders such as:
+Run the Python installer.
+
+## Critical installer option
+
+On the first installer screen, **tick**:
+
+```text
+☑ Add python.exe to PATH
+```
+
+This is important because it lets Windows recognise commands such as:
+
+```cmd
+python
+```
+
+from Command Prompt.
+
+The option:
+
+```text
+Use admin privileges when installing py.exe
+```
+
+is **not required** for this workflow.
+
+Then click:
+
+```text
+Install Now
+```
+
+## After Python finishes installing
+
+On the final installation screen, click:
+
+```text
+Disable path length limit
+```
+
+This is recommended because PlatformIO and compiler toolchains can create deeply nested folder paths.
+
+Then click:
+
+```text
+Close
+```
+
+## Verify Python
+
+Open **Command Prompt** and run:
+
+```cmd
+python --version
+```
+
+You should get a result similar to:
+
+```text
+Python 3.x.x
+```
+
+If `python` is not recognised:
+
+1. Close all existing Command Prompt windows.
+2. Open a new Command Prompt.
+3. Try again.
+4. If necessary, restart Windows after installing Python.
+
+---
+
+# 5. Download mriscoc Special Configurations
+
+Go to:
+
+```text
+https://github.com/mriscoc/Special_Configurations
+```
+
+Use:
+
+```text
+Code → Download ZIP
+```
+
+> [!IMPORTANT]
+> Download the **current repository ZIP from the main repository page**.
+>
+> Do **not** use the old `Source code (zip)` attachment from the historical T13 release page. That release-page source archive is not the workflow being used here.
+
+Extract the ZIP completely.
+
+The extracted folder should contain files and directories similar to:
 
 ```text
 Configurator.pyw
@@ -97,17 +182,49 @@ _features\
 images\
 ```
 
+`Configurator.pyw` must remain together with these supporting files and folders.
+
+---
+
+# 6. Run the mriscoc Configurator
+
+If double-clicking `Configurator.pyw` opens the graphical application, continue to the next section.
+
+If Windows opens it as text, or nothing useful happens, run it manually.
+
+## Easy way to open Command Prompt in the correct folder
+
+1. Open the extracted `Special_Configurations` folder in File Explorer.
+2. Click the File Explorer **address bar**.
+3. Type:
+
+```text
+cmd
+```
+
+4. Press **Enter**.
+
+A Command Prompt window will open already pointed at that folder.
+
 Run:
 
 ```cmd
 python Configurator.pyw
 ```
 
-The **Professional Firmware Configurator** window should open.
+The window title should be:
 
-### Select these exact options
+```text
+Professional Firmware Configurator
+```
 
-| Section | Selection |
+---
+
+# 7. Exact Configurator selections for this Ender 3 V2
+
+Select:
+
+| Configurator section | Selection |
 |---|---|
 | Printer | `Ender3V2` |
 | Board | `422` |
@@ -117,7 +234,7 @@ The **Professional Firmware Configurator** window should open.
 | Thermistor | `T13` |
 | MPC | ✅ Checked |
 
-Leave the other optional features unticked initially, including:
+Leave the other optional feature boxes **unticked initially**, particularly:
 
 ```text
 IS
@@ -128,17 +245,39 @@ NP
 Repeat&Depth
 ```
 
-### Expected generated configuration
+## Why these selections?
 
-Click **Auto**.
+```text
+Ender3V2 = Ender 3 V2 printer
+422      = Creality V4.2.2 motherboard
+BLT      = CR Touch / BLTouch support
+UBL      = Unified Bed Levelling
+DWIN     = this printer's confirmed display type
+T13      = Marlin #13 / 3950 thermistor configuration
+MPC      = Model Predictive temperature control
+```
 
-The configuration name should become:
+### DWIN note
+
+The display on this specific Ender 3 V2 was physically checked and identified as **DWIN**, so leave `DWIN` selected.
+
+---
+
+# 8. Generate the configuration files
+
+Click:
+
+```text
+Auto
+```
+
+The Configuration Name should become:
 
 ```text
 Ender3V2-422-BLTUBL-T13-MPC
 ```
 
-The generated command shown at the bottom should be equivalent to:
+The command shown at the bottom should be equivalent to:
 
 ```python
 CreateConfigs.Generate(
@@ -147,9 +286,19 @@ CreateConfigs.Generate(
 )
 ```
 
-Click **Generate**.
+Then click:
 
-The configurator should create a folder containing approximately:
+```text
+Generate
+```
+
+The configurator should create a folder named approximately:
+
+```text
+Ender3V2-422-BLTUBL-T13-MPC
+```
+
+Inside it should be files including:
 
 ```text
 Configuration.h
@@ -159,19 +308,42 @@ platformio.ini
 log.txt
 ```
 
+> [!NOTE]
+> Windows may hide known file extensions. `platformio.ini` may therefore appear simply as:
+>
+> ```text
+> platformio
+> ```
+>
+> with its Type shown as **Configuration settings**.
+
 ---
 
-## 5. Download the current mriscoc source
+# 9. Download the current mriscoc firmware source
 
-Download the current source from:
+Go to:
 
 ```text
 https://github.com/mriscoc/Ender3V2S1
 ```
 
+Use:
+
+```text
+Code → Download ZIP
+```
+
 Extract it.
 
-The **project root** is the folder containing:
+For simplicity, use a short Windows path if possible, for example:
+
+```text
+C:\mriscoc\
+```
+
+Long project paths can sometimes cause trouble for PlatformIO/compiler tooling.
+
+The true **project root** is the folder that directly contains:
 
 ```text
 Marlin\
@@ -181,13 +353,11 @@ platformio.ini
 README.md
 ```
 
-Do **not** open only the `Marlin` subfolder in VS Code.
-
 ---
 
-## 6. Copy the generated configuration files
+# 10. Copy the generated configuration into the current source
 
-From:
+From the generated folder:
 
 ```text
 Ender3V2-422-BLTUBL-T13-MPC\
@@ -204,10 +374,10 @@ Version.h
 into:
 
 ```text
-<mriscoc project>\Marlin\
+<mriscoc project root>\Marlin\
 ```
 
-Replace the existing files.
+Choose **Replace** when Windows asks.
 
 Then copy:
 
@@ -215,13 +385,13 @@ Then copy:
 platformio.ini
 ```
 
-into:
+into the **project root**:
 
 ```text
-<mriscoc project>\
+<mriscoc project root>\
 ```
 
-Replace the existing `platformio.ini`.
+Again choose **Replace**.
 
 Do **not** copy:
 
@@ -229,17 +399,17 @@ Do **not** copy:
 log.txt
 ```
 
-### Resulting layout
+## Expected structure
 
 ```text
 Ender3V2S1\
 │
-├── platformio.ini              <-- generated file
+├── platformio.ini              <-- generated replacement
 │
 ├── Marlin\
-│   ├── Configuration.h         <-- generated file
-│   ├── Configuration_adv.h     <-- generated file
-│   ├── Version.h               <-- generated file
+│   ├── Configuration.h         <-- generated replacement
+│   ├── Configuration_adv.h     <-- generated replacement
+│   ├── Version.h               <-- generated replacement
 │   └── ...
 │
 ├── buildroot\
@@ -249,56 +419,126 @@ Ender3V2S1\
 
 ---
 
-## 7. Open the project in VS Code
+# 11. Install Visual Studio Code
 
-In VS Code:
+Download VS Code from:
 
 ```text
-File -> Open Folder
+https://code.visualstudio.com/Download
 ```
 
-Open the **project root** — the directory containing `platformio.ini`.
+Install it normally.
 
-Install/enable:
+Launch VS Code.
 
-- PlatformIO IDE
-- Auto Build Marlin
+---
 
-Wait for PlatformIO to finish initialising.
+# 12. Install the required VS Code extensions
 
-Then open **Auto Build Marlin**.
-
-It should detect something similar to:
+Open the **Extensions** panel:
 
 ```text
-Machine Name: Ender3V2-422-BLTUBL-T13-MPC
-Board: CREALITY V4
-Architecture: STM32F1
+Ctrl + Shift + X
+```
+
+Install:
+
+```text
+PlatformIO IDE
+```
+
+and:
+
+```text
+Auto Build Marlin
+```
+
+Restart/reload VS Code if prompted.
+
+### Recognising the icons
+
+In the VS Code left sidebar:
+
+- **Alien-head icon** = PlatformIO
+- **M icon** = Auto Build Marlin
+
+---
+
+# 13. Open the correct project folder in VS Code
+
+Use:
+
+```text
+File → Open Folder
+```
+
+Open the **project root**, not the `Marlin` subfolder.
+
+The folder you open should directly contain:
+
+```text
+Marlin
+buildroot
+ini
+platformio.ini
+README.md
+```
+
+Do **not** open only:
+
+```text
+...\Marlin\
+```
+
+PlatformIO needs to see `platformio.ini` in the project root.
+
+If your extracted ZIP created two similarly named nested folders, select the **inner folder that directly contains `platformio.ini`**.
+
+Wait for PlatformIO to finish initialising. The first launch may take a little time while compiler packages and dependencies are installed.
+
+---
+
+# 14. Open Auto Build Marlin
+
+Click the:
+
+```text
+M
+```
+
+icon on the left sidebar.
+
+Auto Build Marlin should detect the custom project/configuration.
+
+You should see a machine/configuration name corresponding to:
+
+```text
+Ender3V2-422-BLTUBL-T13-MPC
 ```
 
 ---
 
-## 8. Select the correct build target
+# 15. Confirm the MCU before choosing a build target
 
-This printer has:
+This printer was physically checked and has:
 
 ```text
 STM32F103RET6
 ```
 
-Therefore use:
+Therefore the correct Auto Build Marlin target is:
 
 ```text
 STM32F103RE_creality (512K)
 ```
 
-### Correct
+## Correct target
 
 ```text
-STM32F103RE_creality (512K)  -> Build
+STM32F103RE_creality (512K) → Build
 ```
 
-### Do not use
+## Do not use
 
 ```text
 STM32F103RE_creality_xfer
@@ -307,15 +547,21 @@ STM32F103RC_creality_xfer
 STM32F103RE_creality_maple
 ```
 
-The `RC` builds are for an STM32F103RCT6 MCU, not this printer.
+### Why?
+
+`RET6` corresponds to the `RE` target.
+
+The `RC` targets are for an STM32F103RCT6 MCU.
 
 The `_xfer` targets are not the normal SD-card firmware build.
 
+The `maple` environment is not the normal target for this build.
+
 ---
 
-## 9. Compile
+# 16. Compile the firmware
 
-Click:
+In Auto Build Marlin, click:
 
 ```text
 Build
@@ -327,207 +573,239 @@ beside:
 STM32F103RE_creality (512K)
 ```
 
-The first build may take several minutes because PlatformIO can download toolchains and libraries.
+The first compile can take longer because PlatformIO may download compiler/toolchain components.
 
-A successful build ends with:
+A successful build should end with:
 
 ```text
 SUCCESS
 ```
 
-The firmware binary is normally created at approximately:
+The compiled firmware will normally be created at approximately:
 
 ```text
 .pio\build\STM32F103RE_creality\firmware.bin
 ```
 
-The resulting firmware file is expected to be only a few hundred kilobytes. That is normal.
+A firmware size of only a few hundred kilobytes is normal.
 
 ---
 
-## 10. Verify the firmware identity
+# 17. Verify the compiled firmware
 
-Before flashing, confirm the build was generated from the intended configuration.
-
-Expected machine/configuration identity:
+Expected firmware identity:
 
 ```text
 Ender3V2-422-BLTUBL-T13-MPC
 ```
 
-This corresponds to:
+Expected feature meaning:
 
 ```text
 Ender3V2  = Ender 3 V2
-422       = Creality V4.2.2 board
-BLT       = CR Touch / BLTouch support
+422       = Creality V4.2.2
+BLT       = CR Touch / BLTouch
 UBL       = Unified Bed Levelling
-T13       = Marlin #13 / 3950 thermistor configuration
-MPC       = Model Predictive Temperature Control
+T13       = thermistor profile
+MPC       = Model Predictive Control
 ```
+
+Keep a copy of the final `firmware.bin`.
+
+A useful renamed archival copy would be:
+
+```text
+Ender3V2-422-BLTUBL-T13-MPC.bin
+```
+
+Do not necessarily use that long filename for flashing; use a short unique filename on the SD card.
 
 ---
 
-## 11. Prepare the microSD card
+# 18. Prepare the microSD card
 
-Use a small, reliable microSD card.
-
-Format it as:
+Format the microSD card as:
 
 ```text
 FAT32
 ```
 
-Put the compiled `.bin` file in the **root** of the card.
+For the firmware flash:
 
-Use a short, unique filename, for example:
+- Put the `.bin` in the **root** of the card.
+- Prefer only **one firmware `.bin`** on the card.
+- Give the file a short, unique name.
+
+Example:
 
 ```text
 FW260911.bin
 ```
 
-Creality bootloaders may ignore a firmware filename that is identical to one previously flashed, so use a new name for future firmware updates.
+Creality bootloaders can ignore a firmware filename that exactly matches a previously flashed filename, so use a different filename on future firmware updates.
 
-Ideally keep only **one `.bin` firmware file** on the card while flashing.
+You can prepare the card **before the new parts arrive**, but do not boot the printer from it yet.
 
 ---
 
-## 12. Flash only after the hardware is installed
+# 19. Hardware that must be installed before flashing this build
 
-Before flashing, install:
+Install the relevant hardware first:
 
-- Sprite Extruder Pro
-- CR Touch
+- **Sprite Extruder Pro**
+- **CR Touch**
+
+The rest of the planned mechanical upgrades can also be fitted at the same time:
+
 - Dual-Z kit
 - Silicone bed spacers
-- PEI magnetic spring-steel bed
+- PEI magnetic spring-steel build plate
 
-The first two are the critical items for this firmware configuration.
-
-### Flash procedure
-
-1. Power the Ender 3 V2 **off**.
-2. Insert the prepared microSD card.
-3. Power the printer **on**.
-4. Allow the bootloader to flash the firmware.
-5. Wait for the printer to reach the normal mriscoc interface.
-6. Remove the card after confirming the firmware has loaded.
+The **Sprite Pro and CR Touch are the critical firmware-dependent items**.
 
 ---
 
-## 13. First-start checks
+# 20. Flash the firmware
+
+After the Sprite Pro and CR Touch are installed and wired:
+
+1. Turn the printer **off**.
+2. Insert the prepared microSD card.
+3. Turn the printer **on**.
+4. Allow the bootloader to flash the `.bin`.
+5. Wait for the printer to start into the mriscoc interface.
+6. Confirm the firmware starts normally.
+7. Remove the SD card after the flash is complete.
+
+---
+
+# 21. First-start checks
 
 Do **not** immediately start a print.
 
-Check these first:
+Check:
 
-- [ ] Display starts normally
-- [ ] CR Touch powers up and self-tests
-- [ ] X/Y/Z movement directions are correct
-- [ ] Dual-Z moves smoothly
+- [ ] Display starts correctly
+- [ ] mriscoc interface appears
+- [ ] CR Touch powers up
+- [ ] CR Touch deploys and retracts
+- [ ] Room-temperature hot-end reading looks plausible
+- [ ] Bed temperature looks plausible
+- [ ] X movement is correct
+- [ ] Y movement is correct
+- [ ] Z movement is correct
+- [ ] Both Z motors move smoothly
 - [ ] Sprite extruder motor direction is correct
-- [ ] Hot-end temperature reading is plausible at room temperature
-- [ ] Bed temperature reading is plausible
-- [ ] Fans operate correctly
-- [ ] Homing is safe
-- [ ] CR Touch deploys/retracts correctly
+- [ ] Fans operate
+- [ ] Toolhead does not hit the frame
+- [ ] Homing behaves safely
 
 > [!CAUTION]
-> Be ready to switch power off during the first homing test if the probe, Z direction, or toolhead position behaves unexpectedly.
+> Keep a hand near the power switch during the first homing test. If Z direction, probe operation, or toolhead movement is wrong, switch the printer off immediately.
 
 ---
 
-## 14. Calibration after installation
+# 22. Calibration after the rebuild
 
-Once the hardware and firmware are confirmed working, perform calibration in this general order:
+Perform calibration in this general order.
 
-### 1. Square the X gantry
+## 1. Square the X gantry
 
-With dual Z installed, make sure the X gantry is level relative to the frame.
+With dual-Z fitted, make sure the X gantry is mechanically level/square.
 
-### 2. Mechanically tram the bed
+## 2. Tram the bed mechanically
 
-Use the silicone spacers / adjustment wheels to get the bed reasonably parallel to the gantry.
+Use the silicone spacers and adjustment wheels to make the bed reasonably parallel to the gantry.
 
-### 3. Configure CR Touch probe offsets
+## 3. Configure CR Touch X/Y probe offsets
 
-The Sprite Pro changes the probe position relative to the nozzle.
+The Sprite Pro changes the physical probe position relative to the nozzle.
 
-Set the correct:
+Configure the correct:
 
 ```text
 X probe offset
 Y probe offset
 ```
 
-### 4. Set Z-offset
+## 4. Set Z-offset
 
-Carefully set the nozzle-to-bed Z-offset using mriscoc's Z-offset tools.
+Use mriscoc's Z-offset tools to set the correct nozzle-to-bed relationship.
 
-### 5. Generate a UBL mesh
+## 5. Generate a UBL mesh
 
-Probe the bed and save the mesh.
+Probe the bed and save the UBL mesh.
 
-### 6. Calibrate extrusion
+## 6. Calibrate the Sprite extruder
 
-Set/check the Sprite Pro extruder steps.
+Check/calibrate extrusion steps.
 
-Do not assume the old stock extruder value is correct.
+Do not assume the old Ender 3 V2 stock extruder value is correct.
 
-### 7. Run MPC tuning
+## 7. Run MPC tuning
 
-Run hot-end MPC calibration after the Sprite Pro is fitted.
+Run the mriscoc hot-end MPC calibration for the Sprite Pro.
 
-This allows the firmware to characterise the new heater/hot-end thermal behaviour.
+This lets the firmware characterise the new heater and hot-end thermal response.
 
-### 8. Test temperatures progressively
+## 8. Verify temperatures progressively
 
-Start around:
+Start conservatively, for example:
 
 ```text
 200 °C
 ```
 
-then verify operation at:
+Then verify around:
 
 ```text
 230-250 °C
 ```
 
-before considering higher-temperature materials.
+Only consider higher temperatures after normal-temperature operation is confirmed stable and accurate.
 
 ---
 
-## 15. Optional later upgrades
+# 23. Input Shaping and Linear Advance later
 
-Once the printer is mechanically stable and producing good prints, the firmware can be rebuilt with additional features.
+For the first build, leave:
 
-### Input Shaping (`IS`)
+```text
+IS
+LA
+```
 
-Useful for reducing ringing and allowing higher acceleration.
+disabled.
 
-### Linear Advance (`LA`)
+This keeps the initial troubleshooting baseline simple.
 
-Useful for improving extrusion control during acceleration/deceleration.
+Once the rebuilt printer works reliably, these can be added later by recompiling the firmware.
 
-Do **not** enable/tune these at the same time as the initial hardware rebuild. Establish a reliable baseline first.
+## Input Shaping (`IS`)
 
-To add them later:
+Helps reduce ringing/ghosting when using higher acceleration.
 
-1. Reopen `Configurator.pyw`.
-2. Select the same configuration.
+## Linear Advance (`LA`)
+
+Improves extrusion behaviour during acceleration and deceleration.
+
+### To add either later
+
+1. Open `Configurator.pyw`.
+2. Re-select the existing configuration.
 3. Tick `IS` and/or `LA`.
-4. Generate again.
-5. Copy the generated configuration files.
-6. Recompile.
-7. Flash the new `.bin`.
-8. Calibrate the new feature.
+4. Click **Auto**.
+5. Click **Generate**.
+6. Copy the generated config files again.
+7. Recompile.
+8. Flash with a new unique `.bin` filename.
+9. Calibrate the added feature.
 
-No additional printer hardware is necessarily required simply to rebuild the firmware.
+No major mechanical rebuild is required merely to add these firmware features.
 
 ---
 
-## 16. Final build summary
+# 24. Final build reference
 
 ```text
 Printer:          Creality Ender 3 V2
@@ -551,51 +829,79 @@ Ender3V2-422-BLTUBL-T13-MPC
 
 ---
 
-## 17. Keep a recovery copy
+# 25. Recommended firmware archive
 
-Keep copies of:
+Keep the firmware and configuration files together.
 
-```text
-firmware.bin
-Configuration.h
-Configuration_adv.h
-Version.h
-platformio.ini
-```
-
-along with a note of the exact hardware configuration.
-
-A useful archive structure is:
+Example:
 
 ```text
 Ender3V2-Firmware\
+│
 ├── README.md
+│
 ├── firmware\
 │   └── Ender3V2-422-BLTUBL-T13-MPC.bin
+│
 ├── config\
 │   ├── Configuration.h
 │   ├── Configuration_adv.h
 │   ├── Version.h
 │   └── platformio.ini
+│
 └── notes\
     └── calibration-values.md
 ```
 
-This makes future rebuilds, troubleshooting and upgrades much easier.
+After final calibration, record values such as:
+
+```text
+X probe offset:
+Y probe offset:
+Z offset:
+Extruder steps:
+MPC values:
+UBL mesh saved:
+Nozzle size:
+Firmware build date:
+```
+
+This makes future firmware rebuilds and troubleshooting substantially easier.
 
 ---
 
-## Related projects
+# Useful links
 
-- **mriscoc Professional Firmware:**  
-  https://github.com/mriscoc/Ender3V2S1
+**mriscoc Professional Firmware**
 
-- **mriscoc Special Configurations:**  
-  https://github.com/mriscoc/Special_Configurations
+```text
+https://github.com/mriscoc/Ender3V2S1
+```
 
-- **PlatformIO:**  
-  https://platformio.org/
+**mriscoc Special Configurations**
+
+```text
+https://github.com/mriscoc/Special_Configurations
+```
+
+**Python for Windows**
+
+```text
+https://www.python.org/downloads/windows/
+```
+
+**Visual Studio Code**
+
+```text
+https://code.visualstudio.com/Download
+```
+
+**PlatformIO**
+
+```text
+https://platformio.org/
+```
 
 ---
 
-> **Build philosophy:** establish a stable hardware + firmware baseline first. Add Input Shaping, Linear Advance and speed optimisation only after the upgraded printer is printing reliably.
+> **Recommended approach:** first establish a reliable Sprite Pro + CR Touch + UBL + T13 + MPC baseline. Only after the machine is mechanically and thermally stable should Input Shaping, Linear Advance, and higher-speed tuning be added.
