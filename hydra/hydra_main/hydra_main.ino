@@ -106,10 +106,10 @@ static const unsigned long EC_AB_STAGGER_MS = 120000UL; // Wait time between A a
 static const unsigned long EC_B_RETRY_MS      = 5000UL;   // Delay before retrying a failed B command
 
 // EC Down (water) per-dose; set 0.0 to disable automatic EC down-dosing
-static const double EC_DOWN_DOSE_ML = 0.0;
+static const double EC_DOWN_DOSE_ML = 250.0;
 
 // pH Down per-dose
-static const double PH_DOWN_DOSE_ML = 4.0;
+static const double PH_DOWN_DOSE_ML = 2.0;
 
 // Mix/settle lockouts to avoid dosing into an unmixed reservoir
 static const unsigned long EC_UP_MIX_LOCKOUT_MS   = 600000UL; // 10 min after any EC Up action
@@ -119,7 +119,7 @@ static const unsigned long PH_DOWN_MIX_LOCKOUT_MS = 1800000UL; // 30 min after a
 // Hourly caps to bound chemical addition rates (ml per hour)
 static const double  EC_A_MAX_ML_PER_HR    = 40.0;
 static const double  EC_B_MAX_ML_PER_HR    = 40.0;
-static const double  EC_DOWN_MAX_ML_PER_HR = 100.0; // Only meaningful if EC_DOWN_DOSE_ML > 0
+static const double  EC_DOWN_MAX_ML_PER_HR = 1000.0; // Only meaningful if EC_DOWN_DOSE_ML > 0
 static const double  PH_DOWN_MAX_ML_PER_HR = 12.0;
 
 // Sensor cadence: how often a full read/control cycle runs
