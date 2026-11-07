@@ -42,7 +42,7 @@ const char* WIFI_PASS  = "WIFI_PASS";         // Wi-Fi password
 // -----------------------------------------------------------------------------
 // MQTT broker settings
 // -----------------------------------------------------------------------------
-const char* MQTT_HOST   = "192.168.2.16";  // MQTT broker hostname or IP
+const char* MQTT_HOST   = "192.168.20.16";  // MQTT broker hostname or IP
 const uint16_t MQTT_PORT = 1883;           // Broker port (1883 = unencrypted)
 const char* MQTT_USER   = "mqttuser";      // MQTT username
 const char* MQTT_PASSWD = "MQTT_PASSWD";            // MQTT password
